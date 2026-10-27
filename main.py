@@ -46,6 +46,7 @@ CONFIG_FILE = Path("guild_config.json")  # サーバーごとの設定
 BROADCAST_FILE = Path("broadcast_channels.json")  # お知らせの送信先（サーバーごと）
 BLACKLIST_FILE = Path("blacklist.json")  # ブラックリスト（ユーザー / サーバー）
 SERVER_BLACKLIST_FILE = Path("server_blacklist.json")  # サーバーごとのブラックリスト
+LICENSE_FILE = Path("license_suspended.json")  # ライセンス停止中のサーバー
 INDEX_PATH = Path(__file__).parent / "index.html"  # main.pyと同じフォルダのindex.html
 JST = timezone(timedelta(hours=9))
 WEEKDAYS = "月火水木金土日"
@@ -206,6 +207,21 @@ def is_server_user_blacklisted(guild_id: int, user_id: int) -> bool:
     return user_id in load_server_blacklist().get(str(guild_id), [])
 
 
+# ---------- ライセンス（停止中のサーバー） ----------
+def load_license() -> dict[str, dict]:
+    """-> {"サーバーID": {"at": "停止した日時(JST)"}}  ※載っているサーバーが停止中"""
+    raw = storage.load("license", LICENSE_FILE)
+    return {str(k): (v if isinstance(v, dict) else {}) for k, v in raw.items()}
+
+
+def save_license(data: dict[str, dict]) -> None:
+    storage.save("license", LICENSE_FILE, data)
+
+
+def is_license_suspended(guild_id: int) -> bool:
+    return str(guild_id) in load_license()
+
+
 BROADCAST_WARNING = (
     "⚠️ **お知らせの送信先が未設定です。**\n"
     "未設定のままだと、Botからのお知らせは"
@@ -219,7 +235,7 @@ def auth_url(guild_id: int) -> str:
 
 
 # ---------- Discord Bot ----------
-KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist"}  # 残すスラッシュコマンド
+KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license"}  # 残すスラッシュコマンド
 
 
 class AuthBot(discord.Client):
@@ -749,6 +765,79 @@ async def server_blacklist_cmd(interaction: discord.Interaction, action: str,
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@bot.tree.command(name="license",
+                  description="（オーナー専用）サーバーの利用ライセンスを管理します")
+@app_commands.describe(action="操作を選択",
+                       guild_id="対象のサーバーID（停止・有効化のときに指定）")
+@app_commands.choices(action=[
+    app_commands.Choice(name="ライセンス停止 (suspend)", value="suspend"),
+    app_commands.Choice(name="ライセンス有効化 (active)", value="active"),
+    app_commands.Choice(name="停止中のサーバー一覧 (list)", value="list")])
+@app_commands.default_permissions(administrator=True)
+async def license_cmd(interaction: discord.Interaction, action: str,
+                      guild_id: str | None = None):
+    # --- Botのオーナーだけが実行できる ---
+    if interaction.user.id not in await bot.get_owner_ids():
+        await interaction.response.send_message(
+            "このコマンドはBotのオーナー専用です。", ephemeral=True)
+        return
+
+    data = load_license()
+
+    # --- 停止中のサーバー一覧 ---
+    if action == "list":
+        lines, used = [], 0
+        for gid, info in sorted(data.items()):
+            g = bot.get_guild(int(gid))
+            name = g.name if g else "（Bot未参加）"
+            at = info.get("at")
+            ln = f"・`{gid}` {name}" + (f" ／ 停止: {at}" if at else "")
+            if used + len(ln) + 1 > 3800:
+                lines.append(f"…ほか {len(data) - len(lines)} 件")
+                break
+            lines.append(ln)
+            used += len(ln) + 1
+        embed = discord.Embed(
+            title=f"⏸️ ライセンス停止中のサーバー（{len(data)}件）",
+            description="\n".join(lines) if lines else "停止中のサーバーはありません",
+            color=0xF59E0B)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # --- 停止 / 有効化：サーバーIDを確認 ---
+    raw = (guild_id or "").strip()
+    if not raw.isdigit() or not (15 <= len(raw) <= 21):
+        await interaction.response.send_message(
+            "停止・有効化のときは、`guild_id` にサーバーID（数字15〜21桁）を指定してください。",
+            ephemeral=True)
+        return
+    gid = str(int(raw))
+    g = bot.get_guild(int(gid))
+    label = f"「{g.name}」（`{gid}`）" if g else f"サーバー `{gid}`"
+
+    if action == "suspend":
+        if gid in data:
+            await interaction.response.send_message(
+                f"{label} はすでにライセンス停止中です。", ephemeral=True)
+            return
+        data[gid] = {"at": datetime.now(JST).strftime("%Y-%m-%d %H:%M")}
+        save_license(data)
+        msg = (f"⏸️ {label} のライセンスを停止しました。\n"
+               "認証ページ（`/?guild=…`・`/login`・`/callback`）は、すぐにブロックされます。"
+               "Botはサーバーに残ります。")
+    else:  # active
+        if gid not in data:
+            await interaction.response.send_message(
+                f"{label} はライセンス停止中ではありません。", ephemeral=True)
+            return
+        data.pop(gid)
+        save_license(data)
+        msg = f"✅ {label} のライセンスを有効化しました。認証ページが再び使えます。"
+
+    msg += f"\n\n現在の停止中: {len(data)} サーバー"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
 _bot_fatal = False  # トークン無効など、再試行しても直らない失敗
 
 
@@ -921,6 +1010,31 @@ p{{margin:0;line-height:1.8;color:#9ca3af}}
     return HTMLResponse(body, status_code=403)
 
 
+def license_suspended_page() -> HTMLResponse:
+    """ライセンス停止中のサーバー向けの専用エラーページ（403）。"""
+    body = """<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ライセンス停止中</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;
+background:#16110a;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif}
+.card{width:100%;max-width:440px;margin:16px;padding:36px 28px;border-radius:16px;
+background:#201808;border:1px solid #92400e;text-align:center;
+box-shadow:0 0 32px rgba(245,158,11,.22)}
+.icon{font-size:2.6rem;margin-bottom:8px}
+h1{margin:0 0 14px;font-size:1.35rem;color:#fbbf24}
+p{margin:0;line-height:1.8;color:#9ca3af}
+</style></head><body><div class="card">
+<div class="icon">⏸️</div>
+<h1>ライセンス停止中</h1>
+<p>このサーバーの認証機能は、ライセンスが停止されているため利用できません。<br>
+サーバーの管理者にお問い合わせください。</p>
+</div></body></html>"""
+    return HTMLResponse(body, status_code=403)
+
+
 def invite_done_page() -> HTMLResponse:
     """ボット招待後（guild_idあり・stateなし）に表示するページ。"""
     body = """<!DOCTYPE html>
@@ -944,17 +1058,22 @@ p{margin:0;line-height:1.8;color:#9ca3af}
 
 
 # ---------- ルーティング ----------
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])  # UptimeRobotのHEADにも対応
 async def health():
     """定期アクセス(cron-job等)用の軽量なエンドポイント。"""
     return {"ok": True, "bot_ready": bot.is_ready(), "guilds": len(bot.guilds),
             "storage": "upstash" if storage.remote else "local-file"}
 
 
-@app.get("/")
-@app.head("/")
+@app.api_route("/", methods=["GET", "HEAD"])  # UptimeRobotのHEADにも対応
 async def index(guild: int | None = None):
-    if guild is None or str(guild) not in load_config():
+    if guild is None:
+        # サーバー指定なしのアクセス（死活監視のping等）は、200で応答する
+        return result_page(True, "認証Bot 稼働中",
+                           "認証ページは、サーバー管理者が案内するURLからアクセスしてください。")
+    if is_license_suspended(guild):
+        return license_suspended_page()
+    if str(guild) not in load_config():
         return result_page(False, "認証URLが無効です",
                            "サーバー管理者に正しい認証URLを確認してください。")
     if is_guild_blacklisted(guild):
@@ -968,6 +1087,8 @@ async def index(guild: int | None = None):
 
 @app.get("/login")
 async def login(guild: int | None = None):
+    if guild is not None and is_license_suspended(guild):
+        return license_suspended_page()
     if guild is None or str(guild) not in load_config():
         return result_page(False, "認証URLが無効です",
                            "このサーバーは設定されていません。")
@@ -1015,6 +1136,10 @@ async def callback(code: str | None = None, state: str | None = None,
         return result_page(False, "セッションが無効です",
                            "最初からやり直してください。")
     guild_id = issued[1]
+
+    # ライセンス停止中のサーバーからの認証はブロック
+    if is_license_suspended(guild_id):
+        return license_suspended_page()
 
     # ブラックリストのサーバーからの認証はブロック
     if is_guild_blacklisted(guild_id):
@@ -1215,7 +1340,8 @@ if __name__ == "__main__":
     try:
         storage.preload([("guild_config", CONFIG_FILE), ("broadcast", BROADCAST_FILE),
                          ("blacklist", BLACKLIST_FILE),
-                         ("server_blacklist", SERVER_BLACKLIST_FILE)])
+                         ("server_blacklist", SERVER_BLACKLIST_FILE),
+                         ("license", LICENSE_FILE)])
     except Exception as e:
         raise SystemExit("設定の読み込みに失敗しました（Upstashに接続できません）: "
                          f"{type(e).__name__}: {e}")
