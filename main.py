@@ -952,6 +952,7 @@ async def health():
 
 
 @app.get("/")
+@app.head("/")
 async def index(guild: int | None = None):
     if guild is None or str(guild) not in load_config():
         return result_page(False, "認証URLが無効です",
