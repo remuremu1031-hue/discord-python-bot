@@ -39,6 +39,10 @@ PURGE_OLD_COMMANDS = os.getenv("PURGE_OLD_COMMANDS", "0") == "1"  # 1にする�
 WATCHDOG_SECONDS = int(os.getenv("WATCHDOG_SECONDS", "300"))  # Botがこの秒数オフラインならプロセスを終了（ホスト側が再起動）。0で無効
 READY_TIMEOUT = 8.0  # 認証処理でBotの準備完了を待つ最大秒数
 
+# ステータス表示チャンネルの自動更新用設定（環境変数から取得、未設定ならNone）
+STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", "0") or "0")
+STATUS_MESSAGE_ID = int(os.getenv("STATUS_MESSAGE_ID", "0") or "0")
+
 BASE_URL = REDIRECT_URI.removesuffix("/callback").rstrip("/")
 API = "https://discord.com/api/v10"
 STATE_TTL = 600  # 秒
@@ -244,6 +248,7 @@ class AuthBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self._owner_ids: set[int] | None = None
         self._status_task: asyncio.Task | None = None
+        self.status_message_id = STATUS_MESSAGE_ID  # リアルタイムステータス用
 
     async def get_owner_ids(self) -> set[int]:
         """Botのオーナー（チーム所有の場合はチームのオーナー）のIDを返す。"""
@@ -316,6 +321,55 @@ class AuthBot(discord.Client):
         # メンバー数は変動するので、10分ごとにも更新する
         await self.update_status()
 
+    # ---------- リアルタイムステータス表示の定期更新タスク ----------
+    @tasks.loop(minutes=5)
+    async def update_live_status_channel(self):
+        if not STATUS_CHANNEL_ID:
+            return
+        channel = self.get_channel(STATUS_CHANNEL_ID)
+        if not channel:
+            try:
+                channel = await self.fetch_channel(STATUS_CHANNEL_ID)
+            except Exception:
+                return
+
+        latency = round(self.latency * 1000)
+        guilds = len(self.guilds)
+        members = sum((g.member_count or 0) for g in self.guilds)
+        now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+
+        embed = discord.Embed(
+            title="🟢【公式】認証Bot 稼働ステータス",
+            description="現在のシステム稼働状況です。（5分ごとに自動更新）",
+            color=0x2ECC71,
+        )
+        embed.add_field(name="● システムステータス", value="🟢 **認証API:** 正常稼働中\n🟢 **Botプロセス:** 正常稼働中", inline=False)
+        embed.add_field(name="📡 応答速度 (Ping)", value=f"`{latency}ms`", inline=True)
+        embed.add_field(name="🏠 導入サーバー数", value=f"`{guilds:,}` サーバー", inline=True)
+        embed.add_field(name="👤 総メンバー数", value=f"`{members:,}` 人", inline=True)
+        embed.set_footer(text=f"最終更新日時: {now_str}")
+
+        try:
+            if self.status_message_id:
+                try:
+                    msg = await channel.fetch_message(self.status_message_id)
+                    await msg.edit(embed=embed)
+                    return
+                except discord.NotFound:
+                    pass  # メッセージが消されていた場合は新しく投稿し直す
+            
+            # 新規送信
+            msg = await channel.send(embed=embed)
+            self.status_message_id = msg.id
+            print(f"[StatusUpdater] リアルタイムステータスメッセージを新規送信しました。MESSAGE_ID: {msg.id}")
+            print("※次回以降の起動用に .env に STATUS_MESSAGE_ID=<このID> を設定することをおすすめします。")
+        except Exception as e:
+            print(f"[StatusUpdater] ステータスチャンネルの更新に失敗: {e}")
+
+    @update_live_status_channel.before_loop
+    async def before_live_status(self):
+        await self.wait_until_ready()
+
     async def setup_hook(self):
         if SYNC_COMMANDS:
             try:
@@ -331,6 +385,8 @@ class AuthBot(discord.Client):
         # ステータス更新ループを開始（再接続でon_readyが再度呼ばれても二重起動しない）
         if not self.refresh_status.is_running():
             self.refresh_status.start()
+        if STATUS_CHANNEL_ID and not self.update_live_status_channel.is_running():
+            self.update_live_status_channel.start()
 
         # 起動時に1回だけ、不要な古いスラッシュコマンド（例: /veryfi-panel）を削除する
         if not PURGE_OLD_COMMANDS or getattr(self, "_purged", False):
@@ -1486,5 +1542,5 @@ if __name__ == "__main__":
 
     if not REDIRECT_URI:
         raise SystemExit("REDIRECT_URI が決まりません。トンネルの起動に失敗したか、"
-                         ".env に REDIRECT_URI を設定してください。")
+                         .env に REDIRECT_URI を設定してください。")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
