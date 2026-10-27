@@ -1057,6 +1057,129 @@ p{margin:0;line-height:1.8;color:#9ca3af}
     return HTMLResponse(body)
 
 
+# ---------- 利用規約 / プライバシーポリシー ----------
+LEGAL_CSS = """
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:#0b0f19;color:#e5e7eb;line-height:1.9;font-size:16px;
+font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP","Yu Gothic",sans-serif;
+word-break:break-word;overflow-wrap:anywhere}
+.wrap{max-width:760px;margin:0 auto;padding:28px 16px 56px}
+.card{background:rgba(255,255,255,.05);border:1px solid rgba(88,101,242,.45);
+border-radius:16px;padding:28px 22px;box-shadow:0 0 28px rgba(88,101,242,.18)}
+h1{font-size:1.45rem;line-height:1.5;margin:0 0 18px;color:#fff}
+.lead{color:#9ca3af;margin:0 0 6px}
+h2{font-size:1.1rem;line-height:1.6;margin:32px 0 10px;padding-left:12px;
+border-left:4px solid #5865f2;color:#c7d2fe}
+p{margin:0 0 12px}
+ul{margin:0 0 12px;padding-left:1.4em}
+li{margin:6px 0}
+li::marker{color:#8b5cf6}
+nav{margin-top:26px;text-align:center;font-size:.92rem;color:#6b7280}
+nav a{color:#93c5fd;text-decoration:none;margin:0 10px}
+nav a.current{color:#e5e7eb;font-weight:600;pointer-events:none}
+@media (min-width:640px){.wrap{padding-top:48px}.card{padding:42px 46px}h1{font-size:1.75rem}}
+"""
+
+TERMS_TITLE = "【認証ボット】利用規約"
+TERMS_INTRO = ("この利用規約（以下、「本規約」）は、霊夢(remuremu17)（以下、「当方」）が提供する"
+               "Discord認証ボット（以下、「本ボット」）の利用条件を定めるものです。"
+               "本ボットを利用するすべてのユーザー（以下、「ユーザー」）は、本規約に同意したものとみなされます。")
+TERMS_SECTIONS = [
+    ("第1条（適用）", [
+        ("p", "本規約は、ユーザーと当方との間の本ボットの利用に関わる一切の関係に適用されます。"),
+    ]),
+    ("第2条（機能と利用）", [
+        ("p", "本ボットは、Discordサーバーのセキュリティ強化およびメンバーのロール自動付与を"
+              "目的としたOAuth2認証機能を提供します。"),
+        ("p", "ユーザーは、Discordの利用規約およびコミュニティガイドラインを遵守し、"
+              "自己の責任において本ボットを利用するものとします。"),
+    ]),
+    ("第3条（禁止事項）", [
+        ("p", "ユーザーは、本ボットの利用にあたり、以下の行為を行ってはならないものとします。"),
+        ("ul", ["本ボットのシステムに過度な負荷をかける行為、またはハッキングや不正アクセスを試みる行為",
+                "不正な目的や他のユーザーになりすまして認証を行う行為",
+                "本ボットの運営を妨害する行為、または他のユーザーに迷惑をかける行為",
+                "その他、当方が不適切と判断する行為"]),
+    ]),
+    ("第4条（免責事項）", [
+        ("p", "当方は、本ボットの動作にバグや中断がないことを保証するものではありません。"),
+        ("p", "本ボットの利用または利用不能によってユーザーに生じた損害について、"
+              "当方に故意または重大な過失がある場合を除き、一切の責任を負いません。"),
+    ]),
+]
+
+PRIVACY_TITLE = "【認証ボット】プライバシーポリシー"
+PRIVACY_INTRO = ("霊夢(remuremu17)（以下、「当方」）は、提供するDiscord認証ボット（以下、「本ボット」）における"
+                 "ユーザーの個人情報の取扱いについて、以下の通りプライバシーポリシー（以下、「本ポリシー」）を定めます。")
+PRIVACY_SECTIONS = [
+    ("1. 取得する情報", [
+        ("p", "本ボットのOAuth2認証機能を利用する際、以下の情報を取得する場合があります。"),
+        ("ul", ["DiscordのユーザーID、ユーザー名（識別・認証のため）、アバター",
+                "認証時に許可された最小限のスコープ（例：identify 等の基本情報）"]),
+    ]),
+    ("2. 情報の利用目的", [
+        ("p", "取得した情報は、以下の目的のためにのみ利用します。"),
+        ("ul", ["Discordサーバーにおけるユーザーの本人確認およびロールの自動付与",
+                "認証に関するログの記録、および不正アクセスの防止・トラブルシューティング"]),
+    ]),
+    ("3. 第三者提供の制限", [
+        ("p", "当方は、法令に基づく場合を除き、ユーザーの同意を得ることなく、"
+              "取得した個人情報を第三者に提供することはありません。"),
+    ]),
+    ("4. データの管理", [
+        ("p", "取得した情報は、不正アクセスや漏洩を防ぐために適切な管理を行います。"
+              "また、不要となったデータは定期的に削除または匿名化に努めます。"),
+    ]),
+    ("5. データの開示・削除", [
+        ("p", "ユーザーから取得した情報の開示、修正、または削除の希望があった場合、"
+              "本人確認を行った上で、法令および合理的な範囲で速やかに対応いたします。"),
+    ]),
+    ("6. お問い合わせ", [
+        ("p", "本ポリシーに関するお問い合わせは、当サーバーの管理メンバー（または管理者）までご連絡ください。"),
+    ]),
+]
+
+
+def legal_page(title: str, intro: str, sections: list, current: str) -> HTMLResponse:
+    """利用規約・プライバシーポリシー共通のページ（スマホ対応）。"""
+    parts = []
+    for heading, blocks in sections:
+        parts.append(f"<section><h2>{html.escape(heading)}</h2>")
+        for kind, val in blocks:
+            if kind == "ul":
+                items = "".join(f"<li>{html.escape(x)}</li>" for x in val)
+                parts.append(f"<ul>{items}</ul>")
+            else:
+                parts.append(f"<p>{html.escape(val)}</p>")
+        parts.append("</section>")
+    terms_cls = ' class="current"' if current == "terms" else ""
+    privacy_cls = ' class="current"' if current == "privacy" else ""
+    body = f"""<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>{LEGAL_CSS}</style></head><body>
+<div class="wrap"><div class="card">
+<h1>{html.escape(title)}</h1>
+<p class="lead">{html.escape(intro)}</p>
+{"".join(parts)}
+</div>
+<nav><a href="/terms"{terms_cls}>利用規約</a>|<a href="/privacy"{privacy_cls}>プライバシーポリシー</a></nav>
+</div></body></html>"""
+    return HTMLResponse(body)
+
+
+@app.api_route("/terms", methods=["GET", "HEAD"])
+async def terms_page():
+    return legal_page(TERMS_TITLE, TERMS_INTRO, TERMS_SECTIONS, "terms")
+
+
+@app.api_route("/privacy", methods=["GET", "HEAD"])
+async def privacy_page():
+    return legal_page(PRIVACY_TITLE, PRIVACY_INTRO, PRIVACY_SECTIONS, "privacy")
+
+
 # ---------- ルーティング ----------
 @app.api_route("/health", methods=["GET", "HEAD"])  # UptimeRobotのHEADにも対応
 async def health():
