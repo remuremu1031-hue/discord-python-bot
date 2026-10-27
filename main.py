@@ -4,6 +4,7 @@ import copy
 import html
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -19,7 +20,7 @@ import discord
 import httpx
 import uvicorn
 from discord import app_commands
-from discord.ext import tasks
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -38,10 +39,8 @@ SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "1") != "0"  # 0にするとスラッ
 PURGE_OLD_COMMANDS = os.getenv("PURGE_OLD_COMMANDS", "0") == "1"  # 1にすると起動時に不要なコマンドを削除
 WATCHDOG_SECONDS = int(os.getenv("WATCHDOG_SECONDS", "300"))  # Botがこの秒数オフラインならプロセスを終了（ホスト側が再起動）。0で無効
 READY_TIMEOUT = 8.0  # 認証処理でBotの準備完了を待つ最大秒数
-
-# ステータス表示チャンネルの自動更新用設定（環境変数から取得、未設定ならNone）
-STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID", "0") or "0")
-STATUS_MESSAGE_ID = int(os.getenv("STATUS_MESSAGE_ID", "0") or "0")
+STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID") or 0)  # 稼働状況を表示するチャンネル（0で無効）
+STATUS_INTERVAL_MINUTES = min(10, max(5, int(os.getenv("STATUS_INTERVAL_MINUTES") or 5)))  # 更新間隔（5〜10分）
 
 BASE_URL = REDIRECT_URI.removesuffix("/callback").rstrip("/")
 API = "https://discord.com/api/v10"
@@ -51,11 +50,20 @@ BROADCAST_FILE = Path("broadcast_channels.json")  # お知らせの送信先（�
 BLACKLIST_FILE = Path("blacklist.json")  # ブラックリスト（ユーザー / サーバー）
 SERVER_BLACKLIST_FILE = Path("server_blacklist.json")  # サーバーごとのブラックリスト
 LICENSE_FILE = Path("license_suspended.json")  # ライセンス停止中のサーバー
+STATUS_FILE = Path("status_message.json")  # 稼働状況メッセージのID
 INDEX_PATH = Path(__file__).parent / "index.html"  # main.pyと同じフォルダのindex.html
 JST = timezone(timedelta(hours=9))
 WEEKDAYS = "月火水木金土日"
 
 states: dict[str, tuple[float, int]] = {}  # state -> (発行時刻, guild_id)
+
+
+def safe_error(e: Exception) -> str:
+    """ログ用：例外の種類（とHTTPステータス）だけを返す。
+    例外メッセージにはURLなどが含まれることがあるため、そのままは出さない。"""
+    resp = getattr(e, "response", None)
+    code = getattr(resp, "status_code", None) or getattr(e, "status", None)
+    return f"{type(e).__name__}" + (f" (HTTP {code})" if code else "")
 
 
 # ---------- サーバーごとの設定 ----------
@@ -136,7 +144,7 @@ class Storage:
                     return
                 except Exception as e:
                     print(f"設定の保存に失敗（{name}） {attempt + 1}/4: "
-                          f"{type(e).__name__}: {e}")
+                          f"{safe_error(e)}")
                     time.sleep(2 ** attempt)
             print(f"⚠️ {name} をUpstashに保存できませんでした。"
                   "このまま再起動すると、最近の変更が失われます。")
@@ -242,13 +250,16 @@ def auth_url(guild_id: int) -> str:
 KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license"}  # 残すスラッシュコマンド
 
 
-class AuthBot(discord.Client):
+class AuthBot(commands.Bot):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default())
-        self.tree = app_commands.CommandTree(self)
+        # commands.Bot は self.tree（CommandTree）を最初から持っている
+        super().__init__(command_prefix=commands.when_mentioned,
+                         intents=discord.Intents.default(), help_command=None)
         self._owner_ids: set[int] | None = None
         self._status_task: asyncio.Task | None = None
-        self.status_message_id = STATUS_MESSAGE_ID  # リアルタイムステータス用
+
+    async def on_message(self, message: discord.Message):
+        return  # メッセージ起点のコマンドは使わない（スラッシュコマンドのみ）
 
     async def get_owner_ids(self) -> set[int]:
         """Botのオーナー（チーム所有の場合はチームのオーナー）のIDを返す。"""
@@ -321,55 +332,6 @@ class AuthBot(discord.Client):
         # メンバー数は変動するので、10分ごとにも更新する
         await self.update_status()
 
-    # ---------- リアルタイムステータス表示の定期更新タスク ----------
-    @tasks.loop(minutes=5)
-    async def update_live_status_channel(self):
-        if not STATUS_CHANNEL_ID:
-            return
-        channel = self.get_channel(STATUS_CHANNEL_ID)
-        if not channel:
-            try:
-                channel = await self.fetch_channel(STATUS_CHANNEL_ID)
-            except Exception:
-                return
-
-        latency = round(self.latency * 1000)
-        guilds = len(self.guilds)
-        members = sum((g.member_count or 0) for g in self.guilds)
-        now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
-
-        embed = discord.Embed(
-            title="🟢【公式】認証Bot 稼働ステータス",
-            description="現在のシステム稼働状況です。（5分ごとに自動更新）",
-            color=0x2ECC71,
-        )
-        embed.add_field(name="● システムステータス", value="🟢 **認証API:** 正常稼働中\n🟢 **Botプロセス:** 正常稼働中", inline=False)
-        embed.add_field(name="📡 応答速度 (Ping)", value=f"`{latency}ms`", inline=True)
-        embed.add_field(name="🏠 導入サーバー数", value=f"`{guilds:,}` サーバー", inline=True)
-        embed.add_field(name="👤 総メンバー数", value=f"`{members:,}` 人", inline=True)
-        embed.set_footer(text=f"最終更新日時: {now_str}")
-
-        try:
-            if self.status_message_id:
-                try:
-                    msg = await channel.fetch_message(self.status_message_id)
-                    await msg.edit(embed=embed)
-                    return
-                except discord.NotFound:
-                    pass  # メッセージが消されていた場合は新しく投稿し直す
-            
-            # 新規送信
-            msg = await channel.send(embed=embed)
-            self.status_message_id = msg.id
-            print(f"[StatusUpdater] リアルタイムステータスメッセージを新規送信しました。MESSAGE_ID: {msg.id}")
-            print("※次回以降の起動用に .env に STATUS_MESSAGE_ID=<このID> を設定することをおすすめします。")
-        except Exception as e:
-            print(f"[StatusUpdater] ステータスチャンネルの更新に失敗: {e}")
-
-    @update_live_status_channel.before_loop
-    async def before_live_status(self):
-        await self.wait_until_ready()
-
     async def setup_hook(self):
         if SYNC_COMMANDS:
             try:
@@ -380,13 +342,16 @@ class AuthBot(discord.Client):
             await self.leave_blacklisted_guilds()  # 起動時：ブラックリストのサーバーから退出
         except Exception as e:
             print(f"ブラックリストのサーバーからの退出処理に失敗: {type(e).__name__}: {e}")
+        if STATUS_CHANNEL_ID:  # 稼働状況の表示（Cog）を読み込む
+            try:
+                await self.add_cog(StatusCog(self))
+            except Exception as e:
+                print(f"稼働状況表示の読み込みに失敗: {safe_error(e)}")
 
     async def on_ready(self):
         # ステータス更新ループを開始（再接続でon_readyが再度呼ばれても二重起動しない）
         if not self.refresh_status.is_running():
             self.refresh_status.start()
-        if STATUS_CHANNEL_ID and not self.update_live_status_channel.is_running():
-            self.update_live_status_channel.start()
 
         # 起動時に1回だけ、不要な古いスラッシュコマンド（例: /veryfi-panel）を削除する
         if not PURGE_OLD_COMMANDS or getattr(self, "_purged", False):
@@ -415,6 +380,119 @@ class AuthBot(discord.Client):
 
 
 bot = AuthBot()
+
+
+# ---------- 稼働状況の表示（Cog） ----------
+STATUS_TITLE = "📡 認証Bot 稼働状況"
+
+
+class StatusCog(commands.Cog):
+    """サポートサーバー用：稼働状況のEmbedを、定期的に編集して表示する。
+    表示するのは固定の項目だけ（認証API・Bot・Ping・導入サーバー数・最終更新）。
+    URL・ID・トークン・エラー文は、画面にもログにも出さない。"""
+
+    def __init__(self, bot: "AuthBot"):
+        self.bot = bot
+        self._message: discord.Message | None = None
+        self.update_status_message.change_interval(minutes=STATUS_INTERVAL_MINUTES)
+
+    async def cog_load(self):
+        self.update_status_message.start()
+
+    async def cog_unload(self):
+        self.update_status_message.cancel()
+
+    # --- 状態の確認 ---
+    async def check_auth_api(self) -> tuple[bool, int | None]:
+        """認証API（このアプリの /health）が応答するか確認する。URLは表示しない。"""
+        url = (BASE_URL or f"http://localhost:{PORT}") + "/health"
+        started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(url)
+            return r.status_code == 200, int((time.perf_counter() - started) * 1000)
+        except Exception:
+            return False, None
+
+    def build_embed(self, api_ok: bool, api_ms: int | None) -> discord.Embed:
+        bot_ok = self.bot.is_ready() and not self.bot.is_closed()
+        lat = self.bot.latency
+        ping = f"{round(lat * 1000)} ms" if math.isfinite(lat) else "計測中"
+        now = int(time.time())
+
+        if api_ok and bot_ok:
+            color = 0x22C55E   # 緑：すべて正常
+        elif bot_ok:
+            color = 0xF59E0B   # 橙：認証APIだけ異常
+        else:
+            color = 0xEF4444   # 赤：Bot異常
+
+        api_text = "🔴 応答なし"
+        if api_ok:
+            api_text = "🟢 正常" + (f"（{api_ms} ms）" if api_ms is not None else "")
+
+        embed = discord.Embed(title=STATUS_TITLE, color=color)
+        embed.add_field(name="🔐 認証API", value=api_text, inline=True)
+        embed.add_field(name="🤖 Bot", value="🟢 オンライン" if bot_ok else "🔴 オフライン",
+                        inline=True)
+        embed.add_field(name="🏓 Ping", value=ping, inline=True)
+        embed.add_field(name="🏠 導入サーバー数", value=f"{len(self.bot.guilds):,} サーバー",
+                        inline=True)
+        # 相対表示（◯分前）はDiscord側で計算されるので、更新が止まると古さが一目でわかる
+        embed.add_field(name="🕒 最終更新", value=f"<t:{now}:F>（<t:{now}:R>）", inline=False)
+        embed.set_footer(text=f"{STATUS_INTERVAL_MINUTES}分ごとに自動更新")
+        return embed
+
+    # --- メッセージの取得・作成 ---
+    async def _find_message(self, channel) -> discord.Message | None:
+        # 1) 保存してあるIDから（再起動しても同じメッセージを更新できる）
+        saved = storage.load("status_message", STATUS_FILE)
+        if saved.get("channel_id") == channel.id and saved.get("message_id"):
+            try:
+                return await channel.fetch_message(int(saved["message_id"]))
+            except discord.NotFound:
+                pass
+        # 2) 保存がなければ、直近の履歴からBot自身の状況メッセージを探す
+        async for m in channel.history(limit=50):
+            if (m.author.id == self.bot.user.id and m.embeds
+                    and m.embeds[0].title == STATUS_TITLE):
+                return m
+        return None
+
+    async def _send_new(self, channel, embed: discord.Embed) -> discord.Message:
+        msg = await channel.send(embed=embed)
+        storage.save("status_message", STATUS_FILE,
+                     {"channel_id": channel.id, "message_id": msg.id})
+        return msg
+
+    # --- 定期更新 ---
+    @tasks.loop(minutes=5)
+    async def update_status_message(self):
+        try:
+            channel = (self.bot.get_channel(STATUS_CHANNEL_ID)
+                       or await self.bot.fetch_channel(STATUS_CHANNEL_ID))
+            api_ok, api_ms = await self.check_auth_api()
+            embed = self.build_embed(api_ok, api_ms)
+
+            if self._message is None:
+                self._message = await self._find_message(channel)
+            if self._message is None:  # 起動時にメッセージがなければ新規送信
+                self._message = await self._send_new(channel, embed)
+            else:  # あれば上書き更新
+                try:
+                    await self._message.edit(embed=embed)
+                except discord.NotFound:  # 手動で消された場合は作り直す
+                    self._message = await self._send_new(channel, embed)
+        except discord.Forbidden:
+            print("稼働状況の更新: チャンネルの権限が足りません"
+                  "（チャンネルを見る・メッセージを送信・埋め込みリンク・メッセージ履歴を読む）")
+        except Exception as e:
+            print(f"稼働状況の更新エラー: {safe_error(e)}")  # 詳細な文面は出さない
+
+    @update_status_message.before_loop
+    async def _before_update(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(5)  # Webサーバーの起動を待ってから、最初の確認をする
 
 
 @bot.tree.command(name="setup", description="認証ロールとログチャンネルを設定します")
@@ -1521,10 +1599,10 @@ if __name__ == "__main__":
         storage.preload([("guild_config", CONFIG_FILE), ("broadcast", BROADCAST_FILE),
                          ("blacklist", BLACKLIST_FILE),
                          ("server_blacklist", SERVER_BLACKLIST_FILE),
-                         ("license", LICENSE_FILE)])
+                         ("license", LICENSE_FILE), ("status_message", STATUS_FILE)])
     except Exception as e:
         raise SystemExit("設定の読み込みに失敗しました（Upstashに接続できません）: "
-                         f"{type(e).__name__}: {e}")
+                         f"{safe_error(e)}")
     print("設定の保存先:", "Upstash（外部Redis）" if storage.remote
           else "ローカルのJSONファイル（再起動で消える環境では設定が失われます）")
 
@@ -1542,5 +1620,5 @@ if __name__ == "__main__":
 
     if not REDIRECT_URI:
         raise SystemExit("REDIRECT_URI が決まりません。トンネルの起動に失敗したか、"
-                         .env に REDIRECT_URI を設定してください。")
+                         ".env に REDIRECT_URI を設定してください。")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
