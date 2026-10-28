@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import copy
+import hashlib
 import html
 import json
 import logging
@@ -22,8 +23,12 @@ import uvicorn
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import HTMLResponse, RedirectResponse
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 load_dotenv()
 
@@ -39,6 +44,12 @@ SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "1") != "0"  # 0にするとスラッ
 PURGE_OLD_COMMANDS = os.getenv("PURGE_OLD_COMMANDS", "0") == "1"  # 1にすると起動時に不要なコマンドを削除
 WATCHDOG_SECONDS = int(os.getenv("WATCHDOG_SECONDS", "300"))  # Botがこの秒数オフラインならプロセスを終了（ホスト側が再起動）。0で無効
 READY_TIMEOUT = 8.0  # 認証処理でBotの準備完了を待つ最大秒数
+SECURITY_WEBHOOK_URL = os.getenv("SECURITY_WEBHOOK_URL", "").strip()  # 不正アクセス通知のWebhook（未設定なら通知しない）
+RATE_LIMIT_INDEX = os.getenv("RATE_LIMIT_INDEX", "30/minute")  # 認証ページ（/）
+RATE_LIMIT_LOGIN = os.getenv("RATE_LIMIT_LOGIN", "10/minute")  # /login
+RATE_LIMIT_CALLBACK = os.getenv("RATE_LIMIT_CALLBACK", "10/minute")  # /callback
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "1") != "0"  # プロキシ経由のIPヘッダーを使う（直接公開なら0）
+SECURITY_SALT = os.getenv("SECURITY_SALT") or secrets.token_hex(16)  # 通知に出す識別子のハッシュ用
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID") or 0)  # 稼働状況を表示するチャンネル（0で無効）
 STATUS_INTERVAL_MINUTES = min(10, max(5, int(os.getenv("STATUS_INTERVAL_MINUTES") or 5)))  # 更新間隔（5〜10分）
 
@@ -148,6 +159,10 @@ class Storage:
                     time.sleep(2 ** attempt)
             print(f"⚠️ {name} をUpstashに保存できませんでした。"
                   "このまま再起動すると、最近の変更が失われます。")
+            alert_threadsafe("設定の保存に失敗",
+                             f"「{name}」をUpstashに4回保存できませんでした。"
+                             "再起動すると、最近の変更が失われる可能性があります。",
+                             dedupe_key="storage-fail")
 
     def preload(self, items: list[tuple[str, Path]]) -> None:
         for name, path in items:
@@ -973,6 +988,7 @@ async def license_cmd(interaction: discord.Interaction, action: str,
 
 
 _bot_fatal = False  # トークン無効など、再試行しても直らない失敗
+_main_loop: asyncio.AbstractEventLoop | None = None  # スレッドからセキュリティ通知を送るため
 
 
 async def run_bot():
@@ -1019,6 +1035,13 @@ async def watchdog():
             offline_since = now
         elif now - offline_since > WATCHDOG_SECONDS:
             print(f"Botが{WATCHDOG_SECONDS}秒以上オフラインのため、プロセスを再起動します")
+            try:  # 再起動する前に、管理者へ知らせる
+                await asyncio.wait_for(send_security_alert(
+                    "Botが長時間オフライン",
+                    f"{WATCHDOG_SECONDS}秒以上オフラインのため、プロセスを再起動します",
+                    None, level="critical", dedupe_key="watchdog"), 5)
+            except Exception:
+                pass
             os._exit(1)
 
 
@@ -1044,6 +1067,8 @@ def _log_task_result(task: asyncio.Task):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
     bg_tasks = [asyncio.create_task(run_bot()), asyncio.create_task(watchdog())]
     for t in bg_tasks:
         t.add_done_callback(_log_task_result)
@@ -1055,7 +1080,151 @@ async def lifespan(app: FastAPI):
             t.cancel()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)  # /docs 等でAPI構成を公開しない
+
+
+# ---------- セキュリティ（レート制限・不正アクセスの通知） ----------
+def client_ip(request: Request) -> str:
+    """レート制限に使うIP。プロキシ（Render・Cloudflare等）の後ろでは、ヘッダーから本当のIPを取る。
+    ※IPはメモリ上のカウントにだけ使い、保存しない。通知にも生のIPは載せない。"""
+    if TRUST_PROXY_HEADERS:
+        cf = request.headers.get("cf-connecting-ip")  # Cloudflareが付ける（偽装されにくい）
+        if cf:
+            return cf.strip()
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            first = xff.split(",")[0].strip()
+            if first:
+                return first
+    return request.client.host if request.client else "unknown"
+
+
+def client_tag(request: Request) -> str:
+    """通知用の識別子。IPのハッシュの先頭だけ（同じ相手かどうかは分かるが、IPは分からない）。"""
+    return hashlib.sha256(f"{SECURITY_SALT}{client_ip(request)}".encode()).hexdigest()[:10]
+
+
+limiter = Limiter(key_func=client_ip)  # カウントはメモリ上（再起動で消える）
+app.state.limiter = limiter
+
+_bg_tasks: set[asyncio.Task] = set()
+_alert_last: dict[str, float] = {}   # 通知の重複防止（キー → 最後に送った時刻）
+_alert_times: list[float] = []       # 全体の送信回数の制限用
+ALERT_COOLDOWN = 300                 # 同じ種類・同じ相手の通知は、5分に1回まで
+ALERT_MAX_PER_MINUTE = 10            # 全体でも1分に10件まで（Webhookの上限・自己DoS対策）
+_SUSPICIOUS_PATH = re.compile(
+    r"(\.env|\.git|wp-|phpmyadmin|\.php|\.aspx?|/etc/passwd|\.\./|cgi-bin|/admin|"
+    r"\.sql|\.bak|actuator|/vendor/|/shell|/config)", re.I)
+
+
+def fire_and_forget(coro) -> None:
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+def _clean(text: str, limit: int) -> str:
+    """通知に載せる文字列を安全にする（改行・記号・メンションを無害化し、長さを制限）。"""
+    text = re.sub(r"[\x00-\x1f\x7f`]", " ", str(text))
+    return text.replace("@", "@\u200b")[:limit]
+
+
+async def send_security_alert(kind: str, detail: str, request: Request | None = None, *,
+                              level: str = "warning", dedupe_key: str | None = None) -> None:
+    """DiscordのWebhookへ、警告をEmbedで送る。失敗してもアプリは止めない。
+    載せるのは、種類・説明・パス（クエリ文字列なし）・メソッド・IPのハッシュ・UAの一部だけ。"""
+    url = SECURITY_WEBHOOK_URL
+    if not url:
+        return
+    if not url.startswith(("https://discord.com/api/webhooks/",
+                           "https://discordapp.com/api/webhooks/")):
+        return  # 想定外のURLには送らない（URL自体はログに出さない）
+
+    now = time.time()
+    key = dedupe_key or f"{kind}:{client_tag(request) if request else '-'}"
+    last = _alert_last.get(key)
+    if last is not None and now - last < ALERT_COOLDOWN:
+        return  # 同じ内容の通知を連続で送らない
+    _alert_times[:] = [t for t in _alert_times if now - t < 60]
+    if len(_alert_times) >= ALERT_MAX_PER_MINUTE:
+        return  # 攻撃中に通知が溢れないようにする
+    _alert_last[key] = now
+    _alert_times.append(now)
+    if len(_alert_last) > 500:  # 古い記録を捨てて、メモリが増え続けないようにする
+        for k in [k for k, v in _alert_last.items() if now - v > ALERT_COOLDOWN]:
+            _alert_last.pop(k, None)
+
+    colors = {"info": 0x3B82F6, "warning": 0xF59E0B, "critical": 0xEF4444}
+    title = "🚨 重大なアラート" if level == "critical" else "⚠️ セキュリティ警告"
+    fields = [{"name": "種類", "value": _clean(kind, 100), "inline": True},
+              {"name": "時刻", "value": f"<t:{int(now)}:F>", "inline": True}]
+    if request is not None:
+        fields += [
+            {"name": "リクエスト", "value": f"`{_clean(request.method, 10)} "
+                                          f"{_clean(request.url.path, 120)}`", "inline": False},
+            {"name": "相手の識別子", "value": f"`{client_tag(request)}`", "inline": True},
+            {"name": "User-Agent",
+             "value": _clean(request.headers.get("user-agent", "不明"), 80), "inline": True},
+        ]
+    payload = {
+        "username": "セキュリティ通知",
+        "allowed_mentions": {"parse": []},
+        "embeds": [{"title": title, "description": _clean(detail, 500),
+                    "color": colors.get(level, colors["warning"]), "fields": fields}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.post(url, json=payload)
+        if r.status_code >= 300:
+            print(f"セキュリティ通知の送信に失敗 (HTTP {r.status_code})")
+    except Exception as e:
+        print(f"セキュリティ通知の送信に失敗: {safe_error(e)}")  # URLは出さない
+
+
+def alert_threadsafe(kind: str, detail: str, *, level: str = "critical",
+                     dedupe_key: str | None = None) -> None:
+    """別スレッド（Upstashへの保存など）から、セキュリティ通知を送る。"""
+    loop = _main_loop
+    if loop is None or not SECURITY_WEBHOOK_URL:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(
+            send_security_alert(kind, detail, None, level=level,
+                                dedupe_key=dedupe_key or kind), loop)
+    except Exception:
+        pass
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    fire_and_forget(send_security_alert(
+        "レート制限超過", f"短時間にアクセスが集中しました（制限: {exc.detail}）", request))
+    resp = result_page(False, "アクセスが多すぎます",
+                       "短時間にアクセスが集中しました。1分ほど待ってから、もう一度お試しください。",
+                       status=429)
+    resp.headers["Retry-After"] = "60"
+    return resp
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException):
+    # 脆弱性スキャンのような不審なパスへのアクセスを通知する（応答は今まで通り）
+    if exc.status_code == 404 and _SUSPICIOUS_PATH.search(request.url.path):
+        fire_and_forget(send_security_alert(
+            "不審なパスへのアクセス", "存在しない管理系・設定系のパスにアクセスがありました",
+            request))
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    fire_and_forget(send_security_alert(
+        "重大なエラー（500）",
+        f"処理中に {type(exc).__name__} が発生しました（詳細はサーバーのログを確認）",
+        request, level="critical", dedupe_key="error-500"))
+    return result_page(False, "エラーが発生しました",
+                       "時間をおいて、もう一度お試しください。", status=500)
 
 
 # ---------- 認証ログ ----------
@@ -1324,7 +1493,8 @@ async def health():
 
 
 @app.api_route("/", methods=["GET", "HEAD"])  # UptimeRobotのHEADにも対応
-async def index(guild: int | None = None):
+@limiter.limit(RATE_LIMIT_INDEX)
+async def index(request: Request, guild: int | None = None):
     if guild is None:
         # サーバー指定なしのアクセス（死活監視のping等）は、200で応答する
         return result_page(True, "認証Bot 稼働中",
@@ -1344,7 +1514,8 @@ async def index(guild: int | None = None):
 
 
 @app.get("/login")
-async def login(guild: int | None = None):
+@limiter.limit(RATE_LIMIT_LOGIN)
+async def login(request: Request, guild: int | None = None):
     if guild is not None and is_license_suspended(guild):
         return license_suspended_page()
     if guild is None or str(guild) not in load_config():
@@ -1374,7 +1545,8 @@ async def login(guild: int | None = None):
 
 
 @app.get("/callback")
-async def callback(code: str | None = None, state: str | None = None,
+@limiter.limit(RATE_LIMIT_CALLBACK)
+async def callback(request: Request, code: str | None = None, state: str | None = None,
                    error: str | None = None,
                    invited_guild_id: str | None = Query(default=None, alias="guild_id")):
     # ボット招待後のリダイレクト（guild_idあり・stateなし）はエラーにせず案内ページを返す
@@ -1424,6 +1596,9 @@ async def callback(code: str | None = None, state: str | None = None,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         if r.status_code != 200:
+            fire_and_forget(send_security_alert(
+                "OAuth2のトークン交換に失敗", f"Discordから HTTP {r.status_code} が返りました",
+                request, dedupe_key="oauth-token"))
             return result_page(False, "トークン取得に失敗",
                                "認証サーバーとの通信に失敗しました。")
         access_token = r.json()["access_token"]
