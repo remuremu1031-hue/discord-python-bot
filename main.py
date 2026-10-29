@@ -1,36 +1,121 @@
-import os
+"""
+Reimu Support Bot（統合版）
+FastAPI (Uvicorn) + discord.py + Upstash Redis / Render (Web Service)
+
+機能:
+    - GET / : ヘルスチェック（Renderのスリープ防止）
+    - /faq : よくある質問
+    - /setup-role-panel : ロール付与パネル（再起動後もボタン有効）
+    - /announce : サポートサーバー限定アナウンス
+    - /ping, /count : 動作確認・Redisサンプル
+
+必要な環境変数:
+    DISCORD_TOKEN              Discord Botのトークン
+    SUPPORT_GUILD_ID           サポートサーバーのID
+    UPSTASH_REDIS_REST_URL     Upstash RedisのREST URL
+    UPSTASH_REDIS_REST_TOKEN   Upstash RedisのREST Token
+    PORT                       Renderが自動設定（ローカルでは省略可）
+"""
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import discord
+import uvicorn
 from discord import app_commands
 from discord.ext import commands
 from fastapi import FastAPI
-import uvicorn
+from upstash_redis.asyncio import Redis
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("support-bot")
+# ========== ログ ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("reimu-support")
 
-TOKEN = os.environ["DISCORD_TOKEN"]
+
+# ========== 環境変数 ==========
+def require_env(name: str) -> str:
+    """必須の環境変数を取得。無ければ値を出さずに名前だけ示して終了。"""
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"環境変数 {name} が設定されていません。")
+    return value
+
+
+DISCORD_TOKEN = require_env("DISCORD_TOKEN")
+REDIS_URL = require_env("UPSTASH_REDIS_REST_URL")
+REDIS_TOKEN = require_env("UPSTASH_REDIS_REST_TOKEN")
 PORT = int(os.getenv("PORT", "8000"))
-SUPPORT_GUILD_ID = int(os.environ["SUPPORT_GUILD_ID"])
+
+try:
+    SUPPORT_GUILD_ID = int(require_env("SUPPORT_GUILD_ID"))
+except ValueError:
+    raise RuntimeError("環境変数 SUPPORT_GUILD_ID は数値で指定してください。")
 SUPPORT_GUILD = discord.Object(id=SUPPORT_GUILD_ID)
 
 
-# ========== Bot ==========
-class SupportBot(commands.Bot):
-    def __init__(self):
+# ========== Upstash Redis ==========
+redis = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+
+
+async def init_redis() -> None:
+    """起動時に接続確認（失敗してもBot自体は起動させる）"""
+    try:
+        await redis.ping()
+        log.info("Upstash Redis に接続しました。")
+    except Exception as e:
+        # URLやトークンが出ないよう、例外の型だけ記録
+        log.error("Upstash Redis への接続に失敗しました: %s", type(e).__name__)
+
+
+# ========== Discord Bot ==========
+class ReimuBot(commands.Bot):
+    def __init__(self) -> None:
         super().__init__(command_prefix="!", intents=discord.Intents.default())
 
-    async def setup_hook(self):
+    async def setup_hook(self) -> None:
         # 再起動後もロールボタンを復元（discord.py 2.4+）
         self.add_dynamic_items(RoleToggleButton)
         await self.tree.sync()                      # グローバルコマンド
         await self.tree.sync(guild=SUPPORT_GUILD)   # サポートサーバー専用コマンド
+        log.info("スラッシュコマンドを同期しました。")
 
 
-bot = SupportBot()
+bot = ReimuBot()
+
+
+@bot.event
+async def on_ready() -> None:
+    log.info("Discordにログインしました: %s", bot.user)
+
+
+# ========== 動作確認・Redisサンプル ==========
+@bot.tree.command(name="ping", description="BOTの応答確認とRedis接続を確認します")
+async def ping(interaction: discord.Interaction) -> None:
+    latency_ms = round(bot.latency * 1000)
+    try:
+        await redis.ping()
+        redis_status = "✅ 正常"
+    except Exception:
+        redis_status = "❌ 接続エラー"
+    await interaction.response.send_message(
+        f"🏓 Pong! `{latency_ms}ms`\nRedis: {redis_status}", ephemeral=True
+    )
+
+
+@bot.tree.command(name="count", description="コマンド実行回数をカウントします（Redisサンプル）")
+@app_commands.guild_only()
+async def count(interaction: discord.Interaction) -> None:
+    key = f"reimu:{interaction.guild_id}:count"
+    try:
+        n = await redis.incr(key)
+    except Exception:
+        await interaction.response.send_message("❌ データの保存に失敗しました。", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔢 このサーバーでの実行回数: **{n}** 回")
 
 
 # ========== FAQ ==========
@@ -68,7 +153,7 @@ FAQ_DATA = {
     app_commands.Choice(name="認証BOTのエラー・トラブル対処", value="auth"),
     app_commands.Choice(name="利用規約の確認方法", value="terms"),
 ])
-async def faq(interaction: discord.Interaction, topic: app_commands.Choice[str]):
+async def faq(interaction: discord.Interaction, topic: app_commands.Choice[str]) -> None:
     data = FAQ_DATA.get(topic.value)
     if data is None:
         await interaction.response.send_message("❌ 該当するFAQが見つかりません。", ephemeral=True)
@@ -88,6 +173,8 @@ class RoleToggleButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"nexus:role:(?P<role_id>[0-9]+)",
 ):
+    """custom_idにrole_idを埋め込むため、再起動後もDB不要で復元できるボタン"""
+
     def __init__(self, role_id: int, label: str = "通知ロールを切り替える"):
         super().__init__(
             discord.ui.Button(
@@ -144,7 +231,7 @@ async def setup_role_panel(
     title: str = "🔔 アップデート通知ロール",
     description: str = "下のボタンを押すと通知ロールを付与／解除できます。\nもう一度押すと解除されます。",
     button_label: str = "通知ロールを切り替える",
-):
+) -> None:
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ 管理者のみ実行できます。", ephemeral=True)
         return
@@ -256,7 +343,7 @@ async def announce(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
     mention: app_commands.Choice[str] = None,
-):
+) -> None:
     if not _is_support_admin(interaction):
         await interaction.response.send_message(
             "❌ このコマンドはサポートサーバーの管理者のみ使用できます。", ephemeral=True)
@@ -265,26 +352,41 @@ async def announce(
         AnnounceModal(channel, mention.value if mention else "none"))
 
 
-@bot.event
-async def on_ready():
-    log.info("Logged in as %s", bot.user)
-
-
 # ========== FastAPI（lifespanでBot同居） ==========
+async def run_bot() -> None:
+    try:
+        await bot.start(DISCORD_TOKEN)
+    except discord.LoginFailure:
+        log.error("Discordトークンが無効です。DISCORD_TOKEN を確認してください。")
+    except Exception as e:
+        log.error("Botが停止しました: %s", type(e).__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(bot.start(TOKEN))
+    await init_redis()
+    bot_task = asyncio.create_task(run_bot())
     try:
         yield
     finally:
         await bot.close()
-        task.cancel()
+        bot_task.cancel()
+        try:
+            await bot_task
+        except asyncio.CancelledError:
+            pass
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(title="Reimu Support", lifespan=lifespan)
 
 
-@app.get("/health")
+# UptimeRobot等はHEADで監視することもあるため両方受ける
+@app.api_route("/", methods=["GET", "HEAD"])
+async def root():
+    return {"status": "alive", "bot_ready": bot.is_ready()}
+
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok", "bot_ready": bot.is_ready()}
 
