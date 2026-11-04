@@ -5,3 +5,4 @@ upstash-redis
 python-dotenv
 httpx
 slowapi
+redis
