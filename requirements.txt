@@ -3,3 +3,5 @@ uvicorn
 discord.py
 upstash-redis
 python-dotenv
+httpx
+slowapi
