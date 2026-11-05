@@ -56,6 +56,8 @@ RATE_LIMIT_CALLBACK = os.getenv("RATE_LIMIT_CALLBACK", "10/minute")  # /callback
 TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "1") != "0"  # プロキシ経由のIPヘッダーを使う（直接公開なら0）
 SECURITY_SALT = os.getenv("SECURITY_SALT") or secrets.token_hex(16)  # 通知に出す識別子のハッシュ用
 UPSTASH_REDIS_URL = os.getenv("UPSTASH_REDIS_URL", "").strip()  # GBAN用: rediss://default:パスワード@ホスト:6379
+ENABLE_MESSAGE_CONTENT_INTENT = os.getenv("ENABLE_MESSAGE_CONTENT_INTENT", "0") == "1"  # メッセージ内容のログ・招待リンク検知に必要（PortalでMESSAGE CONTENT INTENTもON）
+DISABLED_COGS = {x.strip() for x in os.getenv("DISABLED_COGS", "").split(",") if x.strip()}  # 使わない追加機能（例: tickets,automod）
 ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "0") == "1"  # 参加時の自動BANに必要（Developer PortalでSERVER MEMBERS INTENTもON）
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID") or 0)  # 稼働状況を表示するチャンネル（0で無効）
 STATUS_INTERVAL_MINUTES = min(10, max(5, int(os.getenv("STATUS_INTERVAL_MINUTES") or 5)))  # 更新間隔（5〜10分）
@@ -269,7 +271,13 @@ def auth_url(guild_id: int) -> str:
 
 
 # ---------- Discord Bot ----------
-KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license", "gban", "set-log-channel"}  # 残すスラッシュコマンド
+KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license", "gban", "set-log-channel",
+                 "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
+                 "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban"}  # 残すスラッシュコマンド
+
+
+EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
+              "event_logs", "moderation", "automod"]  # cogs/ フォルダの追加機能
 
 
 class AuthBot(commands.Bot):
@@ -277,6 +285,8 @@ class AuthBot(commands.Bot):
         # commands.Bot は self.tree（CommandTree）を最初から持っている
         intents = discord.Intents.default()
         extra: dict = {}
+        if ENABLE_MESSAGE_CONTENT_INTENT:  # 削除・編集ログの内容表示、招待リンクの検知に使う
+            intents.message_content = True
         if ENABLE_MEMBERS_INTENT:  # 参加時の自動BAN用（メンバー情報は保持せず、メモリを節約する）
             intents.members = True
             extra = dict(chunk_guilds_at_startup=False,
@@ -287,7 +297,19 @@ class AuthBot(commands.Bot):
         self._status_task: asyncio.Task | None = None
 
     async def on_message(self, message: discord.Message):
-        return  # メッセージ起点のコマンドは使わない（スラッシュコマンドのみ）
+        return  # メッセージ起点のコマンドは使わない（スラッシュコマンドのみ）。Cogのリスナーは別に動く
+
+    # --- 追加機能（cogs/）が使う窓口 ---
+    def kv_ready(self) -> bool:
+        return redis_client() is not None
+
+    async def kv(self, op: str, *args):
+        """Redisの操作（例: await bot.kv("get", "key")）。未設定なら RuntimeError。"""
+        return await _redis_do(op, *args)
+
+    async def guild_log(self, guild: discord.Guild, embed: discord.Embed) -> bool:
+        """/set-log-channel で設定された、そのサーバーのログチャンネルへ送る。"""
+        return await send_guild_log(guild, embed)
 
     async def get_owner_ids(self) -> set[int]:
         """Botのオーナー（チーム所有の場合はチームのオーナー）のIDを返す。"""
@@ -368,6 +390,13 @@ class AuthBot(commands.Bot):
         await self.update_status()
 
     async def setup_hook(self):
+        for name in EXTRA_COGS:  # 追加機能（失敗しても、ほかの機能は動かす）
+            if name in DISABLED_COGS:
+                continue
+            try:
+                await self.load_extension(f"cogs.{name}")
+            except Exception as e:
+                print(f"追加機能 {name} の読み込みに失敗: {type(e).__name__}: {e}")
         if SYNC_COMMANDS:
             try:
                 await self.tree.sync()  # グローバルコマンドを現在のコードの内容に同期
@@ -548,6 +577,15 @@ def redis_client():
     return _redis
 
 
+def redis_problem() -> str | None:
+    """Redisが使えない原因（使える状態なら None）。接続URLそのものは含めない。"""
+    if aioredis is None:
+        return "redis ライブラリが入っていません（requirements.txt に redis を追加して再デプロイ）"
+    if not UPSTASH_REDIS_URL:
+        return "環境変数 UPSTASH_REDIS_URL が設定されていません"
+    return None
+
+
 async def _redis_do(op: str, *args):
     """Redisの操作。アイドル切断に備えて、1回だけ再試行する。"""
     r = redis_client()
@@ -565,8 +603,9 @@ async def _redis_do(op: str, *args):
 
 async def gban_startup_check():
     """起動時にRedisへ接続できるか確認し、結果だけをログに出す（接続URLは出さない）。"""
-    if redis_client() is None:
-        print("GBAN: 無効（UPSTASH_REDIS_URL が未設定、または redis がインストールされていません）")
+    problem = redis_problem()
+    if problem:
+        print(f"GBAN: 無効（{problem}）")
         return
     try:
         await _redis_do("ping")
@@ -727,7 +766,7 @@ async def gban_add(interaction: discord.Interaction, user_id: str,
     try:  # 先に登録する（登録できなければ、BANもしない）
         await gban_set(uid, reason, interaction.user.id)
     except Exception as e:
-        msg = ("GBAN機能が未設定です（`UPSTASH_REDIS_URL` と `redis` を確認してください）。"
+        msg = (f"GBAN機能が使えません: {redis_problem()}。"
                if isinstance(e, RuntimeError) else
                f"Redisに保存できませんでした（{safe_error(e)}）。BANは実行していません。")
         await interaction.delete_original_response()  # 「考え中」の公開表示を消して、エラーは本人にだけ見せる
@@ -776,7 +815,7 @@ async def gban_remove(interaction: discord.Interaction, user_id: str):
     try:
         existed = await gban_del(uid)
     except Exception as e:
-        msg = ("GBAN機能が未設定です（`UPSTASH_REDIS_URL` と `redis` を確認してください）。"
+        msg = (f"GBAN機能が使えません: {redis_problem()}。"
                if isinstance(e, RuntimeError) else f"Redisの操作に失敗しました（{safe_error(e)}）。")
         await interaction.response.send_message(msg, ephemeral=True)
         return
@@ -809,7 +848,7 @@ async def set_log_channel_cmd(interaction: discord.Interaction, channel: discord
     try:
         await set_log_channel_id(guild.id, channel.id)
     except Exception as e:
-        msg = ("この機能は、まだ設定されていません（運営者が `UPSTASH_REDIS_URL` を設定する必要があります）。"
+        msg = ("この機能は、現在利用できません。Botの運営者にお問い合わせください。"
                if isinstance(e, RuntimeError) else f"保存に失敗しました（{safe_error(e)}）。")
         await interaction.response.send_message(msg, ephemeral=True)
         return
@@ -1323,6 +1362,11 @@ async def run_bot():
         await bot.connect(reconnect=True)
     except asyncio.CancelledError:
         raise
+    except discord.PrivilegedIntentsRequired:
+        _bot_fatal = True  # 設定を直さない限り直らないので、ウォッチドッグの再起動は止める
+        print("特権インテントが有効になっていません。Developer Portalの Bot ページで "
+              "SERVER MEMBERS INTENT / MESSAGE CONTENT INTENT をオンにするか、"
+              "環境変数 ENABLE_MEMBERS_INTENT / ENABLE_MESSAGE_CONTENT_INTENT を 0 にしてください。")
     except Exception as e:
         print(f"Discordとの接続が終了しました: {type(e).__name__}: {e}")
 
@@ -2103,6 +2147,8 @@ if __name__ == "__main__":
     print("設定の保存先:", "Upstash（外部Redis）" if storage.remote
           else "ローカルのJSONファイル（再起動で消える環境では設定が失われます）")
 
+    print("メッセージ内容の取得:", "有効" if ENABLE_MESSAGE_CONTENT_INTENT
+          else "無効（ENABLE_MESSAGE_CONTENT_INTENT=1 で有効）")
     print("参加時の自動BAN:", "有効（SERVER MEMBERS INTENT を使用）" if ENABLE_MEMBERS_INTENT
           else "無効（ENABLE_MEMBERS_INTENT=1 にすると有効）")
 
