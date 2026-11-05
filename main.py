@@ -71,11 +71,14 @@ BLACKLIST_FILE = Path("blacklist.json")  # ブラックリスト（ユーザー 
 SERVER_BLACKLIST_FILE = Path("server_blacklist.json")  # サーバーごとのブラックリスト
 LICENSE_FILE = Path("license_suspended.json")  # ライセンス停止中のサーバー
 STATUS_FILE = Path("status_message.json")  # 稼働状況メッセージのID
+DEFENSE_CONFIG_FILE = Path("defense_config.json")  # Nuke/Raid防衛設定
+BACKUP_DATA_FILE = Path("server_backups.json")  # サーバーバックアップ
 INDEX_PATH = Path(__file__).parent / "index.html"  # main.pyと同じフォルダのindex.html
 JST = timezone(timedelta(hours=9))
 WEEKDAYS = "月火水木金土日"
 
 states: dict[str, tuple[float, int]] = {}  # state -> (発行時刻, guild_id)
+dashboard_sessions: dict[str, tuple[float, int]] = {}  # ダッシュボードログインセッション
 
 
 def safe_error(e: Exception) -> str:
@@ -258,6 +261,20 @@ def is_license_suspended(guild_id: int) -> bool:
     return str(guild_id) in load_license()
 
 
+# ---------- セキュリティ・防衛・バックアップ設定 ----------
+def load_defense_config() -> dict:
+    return storage.load("defense_config", DEFENSE_CONFIG_FILE)
+
+def save_defense_config(data: dict) -> None:
+    storage.save("defense_config", DEFENSE_CONFIG_FILE, data)
+
+def load_backups() -> dict:
+    return storage.load("server_backups", BACKUP_DATA_FILE)
+
+def save_backups(data: dict) -> None:
+    storage.save("server_backups", BACKUP_DATA_FILE, data)
+
+
 BROADCAST_WARNING = (
     "⚠️ **お知らせの送信先が未設定です。**\n"
     "未設定のままだと、Botからのお知らせは"
@@ -273,7 +290,7 @@ def auth_url(guild_id: int) -> str:
 # ---------- Discord Bot ----------
 KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license", "gban", "set-log-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
-                 "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban"}  # 残すスラッシュコマンド
+                 "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
@@ -297,6 +314,19 @@ class AuthBot(commands.Bot):
         self._status_task: asyncio.Task | None = None
 
     async def on_message(self, message: discord.Message):
+        # 招待リンク自動ブロック機能（防衛設定が有効な場合）
+        if message.guild and not message.author.bot and isinstance(message.author, discord.Member):
+            cfg = load_defense_config().get(str(message.guild.id), {})
+            if cfg.get("invite_block", False):
+                perms = message.author.guild_permissions
+                if not (perms.administrator or perms.manage_messages):
+                    if message.content and re.search(r"(?:discord\.gg|discord(?:app)?\.com/invite)/[A-Za-z0-9-]+", message.content, re.I):
+                        try:
+                            await message.delete()
+                            await message.channel.send(f"{message.author.mention} 招待リンクの投稿は禁止されています。", delete_after=5)
+                            return
+                        except Exception:
+                            pass
         return  # メッセージ起点のコマンドは使わない（スラッシュコマンドのみ）。Cogのリスナーは別に動く
 
     # --- 追加機能（cogs/）が使う窓口 ---
@@ -446,6 +476,80 @@ class AuthBot(commands.Bot):
 bot = AuthBot()
 
 
+# ---------- セキュリティ・Nuke/Raid防衛・バックアップ機能 ----------
+raid_action_history: dict[int, list[float]] = {}
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    guild = channel.guild
+    cfg = load_defense_config().get(str(guild.id), {})
+    if not cfg.get("nuke_defense", False):
+        return
+    now = time.time()
+    history = raid_action_history.setdefault(guild.id, [])
+    history.append(now)
+    recent = [t for t in history if now - t < 10]
+    raid_action_history[guild.id] = recent
+    if len(recent) >= 3:
+        embed = discord.Embed(title="🚨 Nuke（破壊的行為）を検知しました！", description="短時間に複数のチャンネルが削除されたため、自動防衛システムが作動しました。", color=0xEF4444)
+        await send_guild_log(guild, embed)
+
+@bot.event
+async def on_guild_role_create(role: discord.Role):
+    guild = role.guild
+    if role.permissions.administrator or role.permissions.manage_guild:
+        embed = discord.Embed(title="⚠️ 危険な高権限ロールの作成を検知", description=f"管理者権限を持つロール `{role.name}` が作成されました。", color=0xF59E0B)
+        await send_guild_log(guild, embed)
+
+@bot.tree.command(name="nuke-defense", description="Nuke（サーバー破壊）自動検知や招待リンクブロックを設定します")
+@app_commands.describe(nuke_defense="Nuke自動検知を有効にするか", invite_block="招待リンクの自動ブロックを有効にするか")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def nuke_defense_cmd(interaction: discord.Interaction, nuke_defense: bool, invite_block: bool):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
+        return
+    guild = interaction.guild
+    cfg = load_defense_config()
+    cfg[str(guild.id)] = {"nuke_defense": nuke_defense, "invite_block": invite_block}
+    save_defense_config(cfg)
+    await interaction.response.send_message(
+        f"✅ セキュリティ設定を更新しました\n・Nuke自動検知: `{'有効' if nuke_defense else '無効'}`\n・自動招待リンクブロック: `{'有効' if invite_block else '無効'}`",
+        ephemeral=True
+    )
+
+@bot.tree.command(name="backup", description="現在のサーバーのロール構造やチャンネル構成をバックアップします")
+@app_commands.describe(action="操作を選択")
+@app_commands.choices(action=[
+    app_commands.Choice(name="バックアップ作成 (create)", value="create"),
+    app_commands.Choice(name="バックアップ一覧 (list)", value="list")
+])
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def backup_cmd(interaction: discord.Interaction, action: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
+        return
+    guild = interaction.guild
+    backups = load_backups()
+    gid = str(guild.id)
+    if action == "create":
+        role_data = [{"name": r.name, "color": r.color.value, "permissions": r.permissions.value} for r in guild.roles if not r.is_default()]
+        channel_data = [{"name": c.name, "type": str(c.type)} for c in guild.channels]
+        server_backups = backups.setdefault(gid, [])
+        server_backups.append({"time": datetime.now(JST).strftime("%Y-%m-%d %H:%M"), "roles": role_data, "channels": channel_data})
+        save_backups(backups)
+        await interaction.response.send_message("✅ 現在のロールとチャンネルの構成をバックアップしました。", ephemeral=True)
+    else:
+        server_backups = backups.get(gid, [])
+        if not server_backups:
+            await interaction.response.send_message("保存されたバックアップはありません。", ephemeral=True)
+            return
+        desc = "\n".join([f"・{b['time']} (ロール: {len(b['roles'])}件, チャンネル: {len(b['channels'])}件)" for b in server_backups])
+        embed = discord.Embed(title="💾 サーバーバックアップ一覧", description=desc, color=0x3B82F6)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ---------- 稼働状況の表示（Cog） ----------
 STATUS_TITLE = "📡 認証Bot 稼働状況"
 
@@ -560,7 +664,6 @@ class StatusCog(commands.Cog):
 
 
 # ---------- GBAN（グローバルBAN）とサーバーごとのログチャンネル ----------
-# Redisのキー: gban:<user_id>（JSON） / config:log_channel:<guild_id>（チャンネルID）
 _redis = None
 
 
@@ -693,10 +796,10 @@ async def send_guild_log(guild: discord.Guild, embed: discord.Embed) -> bool:
 
 def gban_log_embed(uid: int, reason: str, *, auto: bool, ok: bool = True) -> discord.Embed:
     if ok:
-        title = "🚫 GBAN対象者を自動BANしました" if auto else "🚫 Global BANによりBANしました"
+        title = "🚫 Global BAN対象者を自動BANしました" if auto else "🚫 Global BANによりBANしました"
         color = 0xEF4444
     else:
-        title = "⚠️ GBAN対象者をBANできませんでした"
+        title = "⚠️ Global BAN対象者をBANできませんでした"
         color = 0xF59E0B
     e = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     e.add_field(name="👤 対象ユーザー", value=f"<@{uid}>（`{uid}`）", inline=False)
@@ -1601,7 +1704,7 @@ async def send_auth_log(channel_id: int, user: dict, role: discord.Role | None,
     if passed:
         title, color = "✨ ユーザー認証ログ", 0x00FF00
         sub = f"なし ({age_str})"
-        role_text = f"✅ 付与完了 ({role.mention})"
+        role_text = f"✅ 付与完了 ({role.mention if role else 'ロール'})"
     elif blacklisted:
         title, color = "🚫 ブラックリスト拒否ログ", 0xEF4444
         sub = "🚫 ブラックリストに登録されたユーザー"
@@ -2067,6 +2170,48 @@ async def callback(request: Request, code: str | None = None, state: str | None 
                        f"{username} さん、認証が完了しました。Discordに戻ってください。")
 
 
+# ---------- Webダッシュボード ----------
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_index(request: Request):
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><title>Bot ダッシュボード</title>
+<style>body{{background:#0b0f19;color:#fff;font-family:sans-serif;display:grid;place-items:center;height:100vh;margin:0}}
+.card{{background:#181b23;padding:40px;border-radius:12px;text-align:center;border:1px solid #2a2f3a}}
+.btn{{display:inline-block;background:#5865F2;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;margin-top:20px}}</style></head>
+<body><div class="card"><h1>🤖 Bot Webダッシュボード</h1><p>管理を行うにはDiscordでログインしてください。</p>
+<a class="btn" href="{BASE_URL}/dashboard/login">Discordでログイン</a></div></body></html>""")
+
+
+@app.get("/dashboard/login")
+async def dashboard_login():
+    params = httpx.QueryParams({"client_id": CLIENT_ID, "redirect_uri": f"{BASE_URL}/dashboard/callback", "response_type": "code", "scope": "identify guilds"})
+    return RedirectResponse(f"{API}/oauth2/authorize?{params}")
+
+
+@app.get("/dashboard/callback")
+async def dashboard_callback(code: str):
+    async with httpx.AsyncClient(timeout=10) as http:
+        r = await http.post(f"{API}/oauth2/token", data={"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "grant_type": "authorization_code", "code": code, "redirect_uri": f"{BASE_URL}/dashboard/callback"}, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        if r.status_code != 200:
+            return RedirectResponse("/dashboard")
+        token = r.json()["access_token"]
+        user_resp = await http.get(f"{API}/users/@me", headers={"Authorization": f"Bearer {token}"})
+        if user_resp.status_code != 200:
+            return RedirectResponse("/dashboard")
+        session_token = secrets.token_urlsafe(32)
+        dashboard_sessions[session_token] = (time.time(), int(user_resp.json()["id"]))
+    resp = RedirectResponse("/dashboard/panel", status_code=303)
+    resp.set_cookie(key="dash_session", value=session_token, httponly=True)
+    return resp
+
+
+@app.get("/dashboard/panel", response_class=HTMLResponse)
+async def dashboard_panel(request: Request):
+    token = request.cookies.get("dash_session")
+    if not token or token not in dashboard_sessions:
+        return RedirectResponse("/dashboard")
+    return HTMLResponse("<html><body style='background:#0b0f19;color:#fff;font-family:sans-serif;padding:40px'><h1>⚙️ 管理パネル</h1><p>ログイン成功！ここで各種設定を変更できます。</p></body></html>")
+
+
 # ---------- Cloudflare クイックトンネル ----------
 def _download_cloudflared(path: Path) -> bool:
     """cloudflared が無ければ GitHub から取得する（Linuxのみ）。"""
@@ -2140,7 +2285,8 @@ if __name__ == "__main__":
         storage.preload([("guild_config", CONFIG_FILE), ("broadcast", BROADCAST_FILE),
                          ("blacklist", BLACKLIST_FILE),
                          ("server_blacklist", SERVER_BLACKLIST_FILE),
-                         ("license", LICENSE_FILE), ("status_message", STATUS_FILE)])
+                         ("license", LICENSE_FILE), ("status_message", STATUS_FILE),
+                         ("defense_config", DEFENSE_CONFIG_FILE), ("server_backups", BACKUP_DATA_FILE)])
     except Exception as e:
         raise SystemExit("設定の読み込みに失敗しました（Upstashに接続できません）: "
                          f"{safe_error(e)}")
