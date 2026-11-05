@@ -1,6 +1,5 @@
-"""チケット機能。ボタンでプライベートチャンネルを作り、クローズボタンで閉じる。
-設定は Redis（ticket:config:<guild_id>）。ボタンは再起動後も動く（永続View）。"""
 import asyncio
+import io
 import re
 
 import discord
@@ -32,14 +31,25 @@ class TicketCloseView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    # 1. チケットを閉じるボタン
     @discord.ui.button(label="チケットを閉じる", emoji="🔒", style=discord.ButtonStyle.danger,
-                       custom_id="ticket:close")
+                       custom_id="ticket:close", row=0)
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         cog = interaction.client.get_cog("Tickets")
         if cog is None:
             await reply(interaction, FEATURE_UNAVAILABLE)
             return
         await cog.close_ticket(interaction)
+
+    # 2. トランスクリプト（ログ）保存ボタン
+    @discord.ui.button(label="トランスクリプト保存", emoji="📝", style=discord.ButtonStyle.secondary,
+                       custom_id="ticket:transcript", row=0)
+    async def transcript_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cog = interaction.client.get_cog("Tickets")
+        if cog is None:
+            await reply(interaction, FEATURE_UNAVAILABLE)
+            return
+        await cog.transcript_ticket(interaction)
 
 
 def ticket_owner_id(channel) -> int | None:
@@ -107,7 +117,7 @@ class Tickets(commands.Cog):
         await target.send(embed=embed, view=TicketOpenView())
         await reply(interaction, f"✅ {target.mention} にパネルを送信しました。")
 
-    # --- ボタンの処理 ---
+    # --- ボタンの処理：チケット作成 ---
     async def open_ticket(self, interaction: discord.Interaction):
         guild, user = interaction.guild, interaction.user
         try:
@@ -164,6 +174,39 @@ class Tickets(commands.Cog):
                            allowed_mentions=discord.AllowedMentions(users=True, roles=True))
         await reply(interaction, f"✅ チケットを作成しました: {channel.mention}")
 
+    # --- ボタンの処理：トランスクリプト（ログ）保存 ---
+    async def transcript_ticket(self, interaction: discord.Interaction):
+        channel = interaction.channel
+        owner_id = ticket_owner_id(channel)
+        if owner_id is None:
+            await reply(interaction, "ここはチケットのチャンネルではありません。")
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
+            
+            log_content = f"=== チケットログ: {channel.name} ===\n"
+            log_content += f"作成日時: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            
+            for msg in messages:
+                timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+                log_content += f"[{timestamp}] {msg.author} (ID: {msg.author.id}): {msg.content}\n"
+                if msg.attachments:
+                    for att in msg.attachments:
+                        log_content += f"  [添付ファイル: {att.url}]\n"
+                        
+            file = discord.File(
+                io.BytesIO(log_content.encode('utf-8')), 
+                filename=f"transcript-{channel.name}.txt"
+            )
+            
+            await interaction.followup.send("📝 チケットのトランスクリプトを作成しました。", file=file, ephemeral=True)
+        except Exception as e:
+            print(f"トランスクリプト作成エラー: {safe_error(e)}")
+            await reply(interaction, "ログの生成に失敗しました。")
+
+    # --- ボタンの処理：チケットを閉じる ---
     async def close_ticket(self, interaction: discord.Interaction):
         guild, user, channel = interaction.guild, interaction.user, interaction.channel
         owner_id = ticket_owner_id(channel)
