@@ -654,7 +654,7 @@ async def send_guild_log(guild: discord.Guild, embed: discord.Embed) -> bool:
 
 def gban_log_embed(uid: int, reason: str, *, auto: bool, ok: bool = True) -> discord.Embed:
     if ok:
-        title = "🚫 GBAN対象者を自動BANしました" if auto else "🚫 GBANによりBANしました"
+        title = "🚫 GBAN対象者を自動BANしました" if auto else "🚫 Global BANによりBANしました"
         color = 0xEF4444
     else:
         title = "⚠️ GBAN対象者をBANできませんでした"
