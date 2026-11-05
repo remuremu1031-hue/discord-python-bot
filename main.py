@@ -288,21 +288,13 @@ def auth_url(guild_id: int) -> str:
     return f"{BASE_URL}/?guild={guild_id}"
 
 
-# ---------- チケットコントロールビュー（チャンネル選択トランスクリプト＆削除） ----------
+# ---------- チケットコントロールビュー（ボタン式トランスクリプト＆削除） ----------
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.channel_select(
-        placeholder="📁 トランスクリプトの送信先チャンネルを選択...",
-        min_values=1,
-        max_values=1,
-        channel_types=[discord.ChannelType.text],
-        custom_id="transcript_channel_select",
-        row=0
-    )
-    async def select_transcript_channel(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        selected_channel = select.values[0]
+    @discord.ui.button(label="トランスクリプト保存", style=discord.ButtonStyle.primary, custom_id="ticket_transcript", emoji="📝", row=0)
+    async def transcript_button(self, interaction: discord.Interaction, button: discord.Button):
         await interaction.response.defer(ephemeral=True)
         
         messages = [msg async for msg in interaction.channel.history(limit=None, oldest_first=True)]
@@ -322,18 +314,9 @@ class TicketControlView(discord.ui.View):
             filename=f"transcript-{interaction.channel.name}.txt"
         )
         
-        try:
-            await selected_channel.send(
-                f"📝 **トランスクリプト保存**\n"
-                f"・対象チケット: `{interaction.channel.name}`\n"
-                f"・実行者: {interaction.user.mention}",
-                file=file
-            )
-            await interaction.followup.send(f"✅ トランスクリプトを {selected_channel.mention} に送信しました！", ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"❌ チャンネルへの送信に失敗しました: {e}", ephemeral=True)
+        await interaction.followup.send("📝 チケットのトランスクリプトを作成しました。", file=file, ephemeral=True)
 
-    @discord.ui.button(label="チケット削除", style=discord.ButtonStyle.danger, custom_id="ticket_delete", emoji="🗑️", row=1)
+    @discord.ui.button(label="チケット削除", style=discord.ButtonStyle.danger, custom_id="ticket_delete", emoji="🗑️", row=0)
     async def delete_button(self, interaction: discord.Interaction, button: discord.Button):
         if not interaction.user.guild_permissions.manage_channels:
             await interaction.response.send_message("❌ このボタンを押す権限がありません。", ephemeral=True)
@@ -818,10 +801,10 @@ async def send_guild_log(guild: discord.Guild, embed: discord.Embed) -> bool:
 
 def gban_log_embed(uid: int, reason: str, *, auto: bool, ok: bool = True) -> discord.Embed:
     if ok:
-        title = "🚫 GBAN対象者を自動BANしました" if auto else "🚫 Global BANによりBANしました"
+        title = "🚫 Global BAN対象者を自動BANしました" if auto else "🚫 Global BANによりBANしました"
         color = 0xEF4444
     else:
-        title = "⚠️ GBAN対象者をBANできませんでした"
+        title = "⚠️ Global BAN対象者をBANできませんでした"
         color = 0xF59E0B
     e = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     e.add_field(name="👤 対象ユーザー", value=f"<@{uid}>（`{uid}`）", inline=False)
@@ -865,7 +848,6 @@ async def index_page(request: Request, guild: int = Query(...)):
     if is_guild_blacklisted(guild) or is_license_suspended(guild):
         return HTMLResponse("<h1>このサーバーの認証機能は停止されています。</h1>", status_code=403)
     
-    # ここに認証ページのHTMLを返す処理やリダイレクト処理が入ります
     return HTMLResponse(f"<h1>認証ページ (Server ID: {guild})</h1><a href='/login?guild={guild}'>Discordでログインして認証</a>")
 
 @app.get("/login")
@@ -888,7 +870,6 @@ async def callback(code: str = Query(...), state: str = Query(...)):
         return HTMLResponse("<h1>このサーバーはライセンスが停止されています。</h1>", status_code=403)
 
     async with httpx.AsyncClient() as client:
-        # トークン取得
         token_resp = await client.post(
             f"{API}/oauth2/token",
             data={
@@ -906,7 +887,6 @@ async def callback(code: str = Query(...), state: str = Query(...)):
         token_data = token_resp.json()
         access_token = token_data.get("access_token")
 
-        # ユーザー情報取得
         user_resp = await client.get(
             f"{API}/users/@me",
             headers={"Authorization": f"Bearer {access_token}"}
@@ -920,8 +900,6 @@ async def callback(code: str = Query(...), state: str = Query(...)):
         if is_user_blacklisted(user_id) or is_server_user_blacklisted(guild_id, user_id):
             return HTMLResponse("<h1>あなたはブラックリストに登録されているため認証できません。</h1>", status_code=403)
 
-        # サーバーに参加させる処理など
-        # guild_id に対してロールを付与する処理やサーバー参加処理
         try:
             guild = bot.get_guild(guild_id) or await bot.fetch_guild(guild_id)
             member = guild.get_member(user_id) or await guild.fetch_member(user_id)
@@ -951,4 +929,4 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
- 
+
