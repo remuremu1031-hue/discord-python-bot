@@ -33,7 +33,8 @@ _states: dict[str, float] = {}
 
 TABS = [("overview", "📊 概要"), ("logs", "📜 Botログ"), ("auth", "🔐 認証ログ"),
         ("security", "🚨 Nuke/Raid"), ("gban", "🚫 GBAN"), ("license", "⏸️ ライセンス"),
-        ("blacklist", "⛔ ブラックリスト"), ("guilds", "🏠 サーバー"), ("ips", "🌐 IP連携")]
+        ("blacklist", "⛔ ブラックリスト"), ("blocks", "🧱 自動ブロック"), ("guilds", "🏠 サーバー"),
+        ("ips", "🌐 IP連携")]
 
 CSS = """
 *{box-sizing:border-box}body{margin:0;background:#0b0f19;color:#e5e7eb;
@@ -265,7 +266,7 @@ def register(app, ctx):
         items = ctx.load_incidents()
         if q:
             items = [x for x in items if q.lower() in json.dumps(x, ensure_ascii=False).lower()]
-        cls = {"nuke": "t-ng", "raid": "t-ng", "restore": "t-ok", "warning": "t-warn"}
+        cls = {"nuke": "t-ng", "raid": "t-ng", "abuse": "t-ng", "restore": "t-ok", "warning": "t-warn"}
         rows = "".join(
             f"<tr><td>{_t(x.get('t'))}</td><td><span class='tag {cls.get(x.get('type'), 't-mut')}'>{_e(x.get('type'))}</span></td>"
             f"<td>{_e(x.get('guild_name'))}<br><code>{_e(x.get('guild'))}</code></td>"
@@ -365,7 +366,32 @@ def register(app, ctx):
                 '<div class="wrap"><table><tr><th>IP識別子</th><th>アカウント数</th><th>ユーザーID</th><th>サーバー</th><th>最終認証</th></tr>'
                 + ("".join(rows) or "<tr><td colspan=5 class=mut>該当なし</td></tr>") + "</table></div>")
 
-    TAB_FUNCS = {"overview": tab_overview, "logs": tab_logs, "security": tab_security,
+    async def tab_blocks(sess, q) -> str:
+        d = ctx.load_blocks()
+        now = time.time()
+        rows = []
+        for kind, label in (("user", "Discordユーザー"), ("ip", "Webの接続元")):
+            for ident, r in sorted(d[kind].items(), key=lambda kv: -kv[1].get("until", 0)):
+                active = r.get("until", 0) > now
+                if not active and not q:
+                    continue
+                if q and q not in ident:
+                    continue
+                st = (f'<span class="tag t-ng">ブロック中</span><br><span class="mut">〜{_t(r["until"])}</span>'
+                      if active else '<span class="tag t-mut">期限切れ</span>')
+                who = f"<code>{_e(ident)}</code>" if kind == "user" else f"<code>{_e(ident[:10])}</code>"
+                btn = form(sess, "unblock", hidden("kind", kind) + hidden("id", ident), "解除", "ghost") if active else ""
+                rows.append(f"<tr><td>{label}</td><td>{who}</td><td>{st}</td><td>{_e(r.get('count'))}回目</td>"
+                            f"<td>{_e(r.get('reason'))}<br><span class='mut'>{_e(r.get('detail'))}</span></td>"
+                            f"<td>{_e(r.get('at'))}</td><td>{btn}</td></tr>")
+        return (search_bar("blocks", q, "ユーザーID・識別子（期限切れも検索）") +
+                '<p class="mut">不正利用を検知して自動でブロックした相手です。ブロック時間は回数ごとに '
+                '10分 → 1時間 → 24時間 → 7日 と長くなります。Botのオーナーは対象外です。</p>'
+                '<div class="wrap"><table><tr><th>種類</th><th>対象</th><th>状態</th><th>回数</th><th>理由</th>'
+                '<th>ブロック日時</th><th></th></tr>'
+                + ("".join(rows) or "<tr><td colspan=7 class=mut>ブロック中の相手はいません</td></tr>") + "</table></div>")
+
+    TAB_FUNCS = {"blocks": tab_blocks, "overview": tab_overview, "logs": tab_logs, "security": tab_security,
                  "gban": tab_gban, "license": tab_license, "blacklist": tab_blacklist,
                  "guilds": tab_guilds, "ips": tab_ips}
 
@@ -430,6 +456,7 @@ def register(app, ctx):
         user = r.json()
         uid = int(user["id"])
         if uid not in await ctx.get_owner_ids():
+            ctx.guard_web_strike(request, "dashboard_denied")
             asyncio.create_task(ctx.send_security_alert(
                 "ダッシュボードへの不正ログイン試行",
                 f"Botのオーナー以外のアカウント（ID: {uid}）がダッシュボードにログインしようとしました",
@@ -474,6 +501,7 @@ def register(app, ctx):
             return RedirectResponse("/dashboard/login", status_code=303)
         f = await read_form(request)
         if not secrets.compare_digest(f.get("csrf", ""), sess["csrf"]):
+            ctx.guard_web_strike(request, "bad_dashboard_csrf")
             return denied("操作できません", "CSRFトークンが一致しません。ページを開き直してください。", 400)
         act = f.get("action", "")
         tab, msg = "overview", ""
@@ -526,6 +554,12 @@ def register(app, ctx):
                         bl[kind] = [x for x in bl[kind] if x != tid]
                     ctx.save_blacklist(bl)
                     msg = f"{tid} を{'追加' if act == 'bl_add' else '削除'}しました。"
+            elif act == "unblock":
+                tab = "blocks"
+                kind = f.get("kind") if f.get("kind") in ("user", "ip") else None
+                ident = (f.get("id") or "").strip()[:40]
+                msg = ("ブロックを解除しました。" if kind and ident and ctx.guard_unblock(kind, ident)
+                       else "対象が見つかりません。")
             else:
                 msg = "不明な操作です。"
         except Exception as e:

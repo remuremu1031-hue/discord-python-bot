@@ -41,8 +41,21 @@ try:
 except ImportError:  # 未インストールなら、GBAN機能だけが無効になる
     aioredis = None
 
-import dashboard  # 所有者専用Webダッシュボード（dashboard.py）
-import transcript  # チケットのトランスクリプト生成（transcript.py）
+def _import_optional(name: str):
+    """main.py と同じ階層 → cogs/ フォルダの順に探す。見つからなければ None（その機能だけ無効）。"""
+    import importlib
+    for mod in (name, f"cogs.{name}"):
+        try:
+            return importlib.import_module(mod)
+        except ModuleNotFoundError as e:
+            if e.name not in (name, "cogs", f"cogs.{name}"):
+                raise  # ファイルはあるが、中で別のモジュールが足りない
+    print(f"⚠️ {name}.py が見つかりません（main.py と同じ場所か cogs/ に置いてください）。この機能は無効になります。")
+    return None
+
+
+dashboard = _import_optional("dashboard")  # 所有者専用Webダッシュボード（dashboard.py）
+transcript = _import_optional("transcript")  # チケットのトランスクリプト生成（transcript.py）
 
 
 # ---------- Botのログをメモリにも残す（ダッシュボードで閲覧するため） ----------
@@ -515,6 +528,10 @@ class LicenseTree(app_commands.CommandTree):
     （Botのオーナーは、ライセンスの管理のため対象外）"""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        deny = guard_check_interaction(interaction)  # 自動防御（ブロック中・ブラックリスト・連打）
+        if deny:
+            await _deny_interaction(interaction, deny)
+            return False
         gid = interaction.guild_id
         try:
             if gid is None or not is_license_suspended(gid):
@@ -543,6 +560,8 @@ async def save_ticket_transcript(channel: discord.TextChannel, saved_by: discord
                                  *, reason: str = "手動保存") -> tuple[list[discord.File], str]:
     """チケットの会話をHTMLとテキストにまとめ、設定された送信先チャンネルへ送る。
     戻り値: (保存者へ渡すファイル, 結果メッセージ)"""
+    if transcript is None:
+        raise RuntimeError("transcript.py が見つかりません")
     messages = [m async for m in channel.history(limit=5000, oldest_first=True)]
     html_text = transcript.build_html(channel, messages, saved_by=saved_by,
                                       bot_name=bot.user.name if bot.user else "Bot")
@@ -601,6 +620,9 @@ class TicketControlView(discord.ui.View):
             files, result = await save_ticket_transcript(interaction.channel, interaction.user)
         except discord.Forbidden:
             await interaction.followup.send("❌ メッセージ履歴を読む権限がありません。", ephemeral=True)
+            return
+        except RuntimeError as e:
+            await interaction.followup.send(f"❌ {e}", ephemeral=True)
             return
         await interaction.followup.send(f"📝 トランスクリプトを作成しました。{result}",
                                         files=files, ephemeral=True)
@@ -745,6 +767,13 @@ class AuthBot(commands.Bot):
     def dispatch(self, event_name: str, /, *args, **kwargs):
         """すべてのイベント（自動モデレーション・イベントログ・Nuke検知・cogsのリスナー等）の入口。
         停止中のサーバーのイベントは、Botのオーナーの操作を除いて、ここで捨てる。"""
+        if event_name == "interaction" and args and isinstance(args[0], discord.Interaction) \
+                and args[0].type in (discord.InteractionType.component, discord.InteractionType.modal_submit):
+            inter = args[0]
+            deny = guard_check_interaction(inter)
+            if deny:
+                asyncio.create_task(_deny_interaction(inter, deny))
+                return
         try:
             suspended = suspended_guild_ids()
             if suspended and event_name not in LICENSE_EXEMPT_EVENTS:
@@ -787,8 +816,9 @@ class AuthBot(commands.Bot):
             def gated(*a, __orig=orig, **kw):
                 inter = next((x for x in list(a) + list(kw.values())
                               if isinstance(x, discord.Interaction)), None)
-                if (inter is not None and inter.guild_id and is_license_suspended(inter.guild_id)
-                        and inter.user.id not in (self._owner_ids or set())):
+                if inter is not None and inter.user.id not in (self._owner_ids or set()) and (
+                        guard_blocked("user", inter.user.id) or is_user_blacklisted(inter.user.id)
+                        or (inter.guild_id and is_license_suspended(inter.guild_id))):
                     return None  # 返信は dispatch("interaction") 側で行う
                 return __orig(*a, **kw)
             setattr(store, name, gated)
@@ -2814,10 +2844,192 @@ def alert_threadsafe(kind: str, detail: str, *, level: str = "critical",
         pass
 
 
+# ---------- 自動防御（Bot本体・Webへの不正利用・不正アクセス） ----------
+# 不審な行動に「点数」を付け、一定時間内に合計がしきい値を超えた相手を自動でブロックする。
+# ブロック時間は繰り返すほど長くなる（10分 → 1時間 → 24時間 → 7日）。
+#   Web : 接続元IP（の鍵付きハッシュ）単位。ブロック中は全ページ 403
+#   Bot : DiscordユーザーID単位。ブロック中はコマンド・ボタン・メニューをすべて拒否
+# ブロックの記録は Upstash / JSON に保存されるので、再起動しても続く。Botオーナーは対象外。
+SEC_BLOCK_FILE = Path("security_blocks.json")
+GUARD_THRESHOLD = int(os.getenv("GUARD_THRESHOLD", "6"))      # この点数で自動ブロック
+GUARD_WINDOW = int(os.getenv("GUARD_WINDOW_SECONDS", "3600"))  # 点数を数える期間
+GUARD_DURATIONS = [600, 3600, 86400, 7 * 86400]                # 1回目, 2回目, 3回目, 4回目以降
+GUARD_POINTS = {
+    # Web
+    "suspicious_path": 2, "rate_limit": 2, "bad_state": 1, "dashboard_denied": 6, "bad_dashboard_csrf": 3,
+    # Bot
+    "owner_command": 2, "interaction_flood": 6, "blacklisted_use": 0,
+}
+GUARD_LABEL = {
+    "suspicious_path": "脆弱性を探す不審なパスへのアクセス", "rate_limit": "レート制限の超過",
+    "bad_state": "不正・期限切れの認証セッション", "dashboard_denied": "ダッシュボードへの不正ログイン",
+    "bad_dashboard_csrf": "ダッシュボードへの偽装リクエスト",
+    "owner_command": "オーナー専用コマンドの不正使用", "interaction_flood": "コマンド・ボタンの連打（スパム）",
+}
+OWNER_ONLY_COMMANDS = {"gban", "broadcast", "blacklist", "license"}
+INTERACTION_FLOOD = (int(os.getenv("GUARD_FLOOD_COUNT", "12")), 10)  # 10秒に12回を超えたら連打
+_guard_points: dict[str, deque] = {}
+_guard_inter: dict[int, deque] = {}
+
+
+def load_blocks() -> dict:
+    """-> {"ip": {識別子: {...}}, "user": {ユーザーID: {...}}}"""
+    d = storage.load("security_blocks", SEC_BLOCK_FILE)
+    d.setdefault("ip", {})
+    d.setdefault("user", {})
+    return d
+
+
+def guard_web_id(request: Request) -> str | None:
+    """Webの相手の識別子。他人のIPを名乗ってその人をブロックさせる手口を防ぐため、
+    X-Forwarded-For は経路全体で識別する。プライベートIPなど本人を表さないものは None。"""
+    cf = request.headers.get("cf-connecting-ip") if TRUST_PROXY_HEADERS else None
+    xff = request.headers.get("x-forwarded-for") if TRUST_PROXY_HEADERS else None
+    raw = cf or (xff or "").replace(" ", "") or (request.client.host if request.client else "")
+    first = raw.split(",")[0]
+    if not first or normalize_ip(first) is None:
+        return None
+    return hmac.new(IP_HASH_KEY, ("web:" + raw).encode(), hashlib.sha256).hexdigest()[:24]
+
+
+def guard_blocked(kind: str, ident) -> dict | None:
+    rec = load_blocks()[kind].get(str(ident))
+    if rec and rec.get("until", 0) > time.time():
+        return rec
+    return None
+
+
+def guard_unblock(kind: str, ident) -> bool:
+    d = load_blocks()
+    rec = d[kind].get(str(ident))
+    if not rec:
+        return False
+    rec["until"] = 0  # 回数（次回の長さ）の記録は残す
+    storage.save("security_blocks", SEC_BLOCK_FILE, d)
+    return True
+
+
+def guard_strike(kind: str, ident, reason: str, *, request: Request | None = None,
+                 detail: str = "") -> None:
+    """不審な行動を1件記録し、しきい値を超えたら自動ブロックする。"""
+    if ident is None:
+        return
+    pts = GUARD_POINTS.get(reason, 1)
+    if pts <= 0:
+        return
+    key = f"{kind}:{ident}"
+    now = time.time()
+    dq = _guard_points.setdefault(key, deque(maxlen=200))
+    dq.append((now, pts, reason))
+    while dq and now - dq[0][0] > GUARD_WINDOW:
+        dq.popleft()
+    if len(_guard_points) > 5000:
+        for k in [k for k, v in _guard_points.items() if not v or now - v[-1][0] > GUARD_WINDOW][:2000]:
+            _guard_points.pop(k, None)
+    if guard_blocked(kind, ident) or sum(p for _, p, _ in dq) < GUARD_THRESHOLD:
+        return
+    reasons = sorted({GUARD_LABEL.get(r, r) for _, _, r in dq})
+    dq.clear()
+    fire_and_forget(_guard_block(kind, str(ident), reasons, detail, request))
+
+
+async def _guard_block(kind: str, ident: str, reasons: list[str], detail: str, request: Request | None):
+    d = load_blocks()
+    prev = d[kind].get(ident, {})
+    count = int(prev.get("count", 0)) + 1
+    dur = GUARD_DURATIONS[min(count, len(GUARD_DURATIONS)) - 1]
+    d[kind][ident] = {"until": int(time.time() + dur), "count": count, "reason": "、".join(reasons),
+                      "at": datetime.now(JST).strftime("%Y-%m-%d %H:%M"), "detail": detail[:200]}
+    storage.save("security_blocks", SEC_BLOCK_FILE, d)
+    span = f"{dur // 86400}日" if dur >= 86400 else (f"{dur // 3600}時間" if dur >= 3600 else f"{dur // 60}分")
+    who = f"<@{ident}>（`{ident}`）" if kind == "user" else f"接続元 `{ident[:10]}`"
+    print(f"🧱 自動ブロック: {kind} {ident[:10]} / {span} / {'、'.join(reasons)}")
+    record_incident({"type": "abuse", "kind": kind, "actor": ident if kind == "user" else None,
+                     "actor_name": ident[:10] if kind == "ip" else ident, "count": count,
+                     "result": f"{span}ブロック（{count}回目）: {'、'.join(reasons)}"})
+    fire_and_forget(send_security_alert(
+        "自動ブロック", f"{'Discordユーザー' if kind == 'user' else 'Webの接続元'}を{span}ブロックしました"
+        f"（{count}回目）: {'、'.join(reasons)}", request, level="critical", dedupe_key=f"block:{kind}:{ident}"))
+    embed = discord.Embed(title="🧱 不正利用を検知して自動ブロックしました", color=0xEF4444,
+                          timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="対象", value=who, inline=False)
+    embed.add_field(name="理由", value="、".join(reasons)[:1000], inline=False)
+    if detail:
+        embed.add_field(name="詳細", value=detail[:1000], inline=False)
+    embed.add_field(name="ブロック期間", value=f"{span}（{count}回目）", inline=True)
+    embed.set_footer(text="解除はダッシュボードの「自動ブロック」タブから")
+    await dm_owners(embed, dedupe=f"block:{kind}:{ident}", cooldown=60)
+
+
+def guard_check_interaction(interaction: discord.Interaction) -> str | None:
+    """Botへの操作を許可してよいか。拒否するときは、表示する理由を返す。（オーナーは常に許可）"""
+    uid = interaction.user.id
+    if uid in (bot._owner_ids or set()):
+        return None
+    if guard_blocked("user", uid):
+        return "🧱 不正な利用が検知されたため、一時的にこのBotを利用できません。"
+    if is_user_blacklisted(uid):
+        return "🚫 このアカウントは、このBotの利用が制限されています。"
+    if interaction.type == discord.InteractionType.autocomplete:
+        return None  # 入力中の候補表示は連打に数えない
+    now = time.time()
+    dq = _guard_inter.setdefault(uid, deque(maxlen=50))
+    dq.append(now)
+    while dq and now - dq[0] > INTERACTION_FLOOD[1]:
+        dq.popleft()
+    if len(dq) > INTERACTION_FLOOD[0]:
+        dq.clear()
+        guard_strike("user", uid, "interaction_flood",
+                     detail=f"{INTERACTION_FLOOD[1]}秒間に{INTERACTION_FLOOD[0]}回を超える操作"
+                            f"（サーバー: {interaction.guild_id or 'DM'}）")
+        return "🧱 操作が多すぎるため、一時的にこのBotを利用できません。"
+    if interaction.type == discord.InteractionType.application_command:
+        name = ((interaction.data or {}).get("name") or "")
+        if name in OWNER_ONLY_COMMANDS:
+            guard_strike("user", uid, "owner_command",
+                         detail=f"/{name} を実行（サーバー: {interaction.guild_id or 'DM'}）")
+            fire_and_forget(send_security_alert(
+                "オーナー専用コマンドの不正使用",
+                f"オーナー以外（ユーザーID: {uid}）が /{name} を実行しようとしました", None,
+                dedupe_key=f"ownercmd:{uid}"))
+    return None
+
+
+async def _deny_interaction(interaction: discord.Interaction, text: str) -> None:
+    try:
+        if interaction.type == discord.InteractionType.autocomplete:
+            await interaction.response.autocomplete([])
+        elif interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+@app.middleware("http")
+async def guard_middleware(request: Request, call_next):
+    """自動ブロック中の接続元は、すべてのページで 403 を返す。"""
+    ident = guard_web_id(request)
+    request.state.guard_id = ident
+    if ident and guard_blocked("ip", ident):
+        return HTMLResponse("<!DOCTYPE html><meta charset='utf-8'><title>403</title>"
+                            "<p style='font-family:sans-serif;padding:2em'>不正なアクセスが検知されたため、"
+                            "一時的にアクセスを制限しています。</p>", status_code=403,
+                            headers={"Cache-Control": "no-store"})
+    return await call_next(request)
+
+
+def guard_web_strike(request: Request, reason: str, detail: str = "") -> None:
+    guard_strike("ip", getattr(request.state, "guard_id", None) or guard_web_id(request), reason,
+                 request=request, detail=detail)
+
+
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     fire_and_forget(send_security_alert(
         "レート制限超過", f"短時間にアクセスが集中しました（制限: {exc.detail}）", request))
+    guard_web_strike(request, "rate_limit", f"{request.url.path}（制限: {exc.detail}）")
     resp = result_page(False, "アクセスが多すぎます",
                        "短時間にアクセスが集中しました。1分ほど待ってから、もう一度お試しください。",
                        status=429)
@@ -2832,6 +3044,7 @@ async def http_error_handler(request: Request, exc: StarletteHTTPException):
         fire_and_forget(send_security_alert(
             "不審なパスへのアクセス", "存在しない管理系・設定系のパスにアクセスがありました",
             request))
+        guard_web_strike(request, "suspicious_path", request.url.path[:100])
     return await http_exception_handler(request, exc)
 
 
@@ -3064,6 +3277,7 @@ li{margin:6px 0}
 li::marker{color:#8b5cf6}
 nav{margin-top:26px;text-align:center;font-size:.92rem;color:#6b7280}
 nav a{color:#93c5fd;text-decoration:none;margin:0 10px}
+section a{color:#93c5fd;word-break:break-all}
 nav a.current{color:#e5e7eb;font-weight:600;pointer-events:none}
 @media (min-width:640px){.wrap{padding-top:48px}.card{padding:42px 46px}h1{font-size:1.75rem}}
 """
@@ -3126,6 +3340,8 @@ TERMS_SECTIONS = [
 PRIVACY_TITLE = "【霊夢BOT】プライバシーポリシー"
 PRIVACY_INTRO = ("霊夢(remuremu17)（以下、「当方」）は、提供するDiscordボット「霊夢BOT」（以下、「本ボット」）における"
                  "ユーザーの個人情報の取扱いについて、以下の通りプライバシーポリシー（以下、「本ポリシー」）を定めます。")
+SUPPORT_SERVER_URL = os.getenv("SUPPORT_SERVER_URL", "https://discord.gg/eWpUkX9bPM")  # サポートサーバー
+
 PRIVACY_SECTIONS = [
     ("1. 取得する情報", [
         ("p", "本ボットのOAuth2認証機能を利用する際、以下の情報を取得する場合があります。"),
@@ -3190,7 +3406,9 @@ PRIVACY_SECTIONS = [
               "ただし、不正防止のために必要な記録は、保存期間内は削除をお断りする場合があります。"),
     ]),
     ("8. お問い合わせ", [
-        ("p", "本ポリシーに関するお問い合わせは、当サーバーの管理メンバー（または管理者）までご連絡ください。"),
+        ("p", "本ポリシーおよび本ボットに関するお問い合わせ・データの開示や削除のご依頼は、"
+              "以下のサポートサーバーまでご連絡ください。"),
+        ("link", ("サポートサーバー：", SUPPORT_SERVER_URL)),
     ]),
 ]
 
@@ -3215,6 +3433,10 @@ def legal_page(title: str, intro: str, sections: list, current: str) -> HTMLResp
             if kind == "ul":
                 items = "".join(f"<li>{html.escape(x)}</li>" for x in val)
                 parts.append(f"<ul>{items}</ul>")
+            elif kind == "link":
+                label, url = val
+                parts.append(f'<p>{html.escape(label)}<a href="{html.escape(url)}" target="_blank" '
+                             f'rel="noopener noreferrer">{html.escape(url)}</a></p>')
             else:
                 parts.append(f"<p>{html.escape(val)}</p>")
         parts.append("</section>")
@@ -3320,6 +3542,8 @@ async def callback(request: Request, code: str | None = None, state: str | None 
                    invited_guild_id: str | None = Query(default=None, alias="guild_id")):
     # ダッシュボードのログイン（state が dash_ で始まる）は、ダッシュボード側で処理する
     if state and state.startswith("dash_"):
+        if dashboard_callback is None:
+            return result_page(False, "ダッシュボードは無効です", "dashboard.py が見つかりません。", status=404)
         return await dashboard_callback(request, None if error else code, state)
     # ボット招待後のリダイレクト（guild_idあり・stateなし）はエラーにせず案内ページを返す
     if invited_guild_id and not state:
@@ -3335,6 +3559,7 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
     issued = states.pop(state or "", None)
     if issued is None or time.time() - issued[0] > STATE_TTL:
+        guard_web_strike(request, "bad_state")
         return result_page(False, "セッションが無効です",
                            "最初からやり直してください。")
     guild_id = issued[1]
@@ -3502,7 +3727,7 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 # ---------- 所有者専用ダッシュボード（/dashboard） ----------
 from types import SimpleNamespace  # noqa: E402
 
-dashboard_callback = dashboard.register(app, SimpleNamespace(
+dashboard_callback = None if dashboard is None else dashboard.register(app, SimpleNamespace(
     bot=bot, client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
     base_url=lambda: BASE_URL or f"http://localhost:{PORT}",  # クイックトンネルで後から変わるので関数で渡す
     oauth_redirect_uri=lambda: REDIRECT_URI,  # 認証と同じ /callback を使う（追加のRedirect登録は不要）
@@ -3514,6 +3739,7 @@ dashboard_callback = dashboard.register(app, SimpleNamespace(
     load_blacklist=load_blacklist, save_blacklist=save_blacklist,
     load_ip_index=load_ip_index, load_defense_config=load_defense_config, load_config=load_config,
     gban_list=gban_list, gban_add_all=gban_add_all, gban_del=gban_del,
+    load_blocks=load_blocks, guard_unblock=guard_unblock, guard_web_strike=guard_web_strike,
     ip_retention_days=IP_RETENTION_DAYS,
 ))
 
@@ -3596,6 +3822,7 @@ if __name__ == "__main__":
                          ("ip_index", IP_INDEX_FILE), ("auth_logs", AUTH_LOG_FILE),
                          ("security_incidents", INCIDENT_FILE), ("ticket_config", TICKET_CONFIG_FILE),
                          ("subaccount_config", SUBACCOUNT_CONFIG_FILE),
+                         ("security_blocks", SEC_BLOCK_FILE),
                          ("weather_config", Path("weather_config.json")),
                          ("invite_log_config", Path("invite_log_config.json")),
                          ("disaster_config", Path("disaster_config.json"))])
