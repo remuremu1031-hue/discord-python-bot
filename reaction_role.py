@@ -12,7 +12,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .common import FEATURE_UNAVAILABLE, is_admin, rdo, reply, safe_error
+try:  # cogs/ フォルダの中に置いた場合
+    from .common import FEATURE_UNAVAILABLE, is_admin, rdo, reply, safe_error
+except ImportError:  # main.py と同じ階層（ルート直下）に置いた場合
+    from common import FEATURE_UNAVAILABLE, is_admin, rdo, reply, safe_error
 
 
 def rr_key(guild_id: int) -> str:
