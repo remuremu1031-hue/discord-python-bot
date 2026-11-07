@@ -629,12 +629,12 @@ KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
                  "nuke-whitelist", "subaccount", "transcript-channel", "help",
-                 "weather", "disaster"}  # 残すスラッシュコマンド
+                 "weather", "disaster", "sticky", "invite-stats", "tts", "music"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
               "event_logs", "moderation", "automod",
-              "jma_alerts", "help"]  # cogs/ フォルダの追加機能
+              "jma_alerts", "help", "sticky", "invite_tracker", "tts", "music"]  # cogs/ フォルダの追加機能
 
 # ファイル名の別名（例: reaction_role.py でも reaction_roles として読み込む）
 COG_ALIASES = {"reaction_roles": ["reaction_role"], "event_logs": ["event_log"],
@@ -2140,8 +2140,6 @@ async def panel_cmd(interaction: discord.Interaction,
                      f"{role_text} が自動で付与されます。"),
         color=0x5865F2,
     )
-    embed.set_footer(text="認証時に、ユーザーID・アカウント名とIPアドレス（不正防止のため）を取得します"
-                          "｜詳しくは /privacy をご覧ください")
 
     view = discord.ui.View()
     view.add_item(discord.ui.Button(
@@ -2892,8 +2890,15 @@ async def send_auth_log(channel_id: int, user: dict, role: discord.Role | None,
     uid = int(user["id"])
     ipres = ipres or {"status": "unknown", "linked": [], "flags": []}
     sub_label = {"hit": "⚠️ 該当", "clear": "✅ 非該当"}.get(ipres["status"], "❔ 判定不可（IPを取得できません）")
+    # 参加に使った招待リンク（invite_tracker が記録したもの）
+    inv = None
+    if getattr(bot, "get_join_invite", None):
+        try:
+            inv = await bot.get_join_invite(guild_id, uid)
+        except Exception as e:
+            print(f"招待情報の取得に失敗: {safe_error(e)}")
     # ダッシュボード用に記録（チャンネルへ送れなくても残す）
-    append_auth_log({"t": int(time.time()), "guild": guild_id, "user": uid,
+    append_auth_log({"invite": inv,"t": int(time.time()), "guild": guild_id, "user": uid,
                      "name": user.get("username"), "passed": passed, "blacklisted": blacklisted,
                      "sub": ipres["status"], "linked": ipres["linked"][:20],
                      "flags": [[k, v] for k, v in ipres["flags"]][:10],
@@ -2938,6 +2943,9 @@ async def send_auth_log(channel_id: int, user: dict, role: discord.Role | None,
         embed.add_field(name="🚨 IP連携の警告",
                         value="\n".join(f"・{FLAG_LABEL.get(k, k)}（<@{v}>）と同一IP"
                                         for k, v in ipres["flags"][:5]), inline=False)
+    if getattr(bot, "describe_invite", None):
+        for n, v in bot.describe_invite(inv):
+            embed.add_field(name=f"📨 {n}", value=v[:1024], inline=n != "招待リンク")
     if reason:
         embed.add_field(name="📄 判定理由", value=reason[:500], inline=False)
     embed.add_field(name="🏷️ ロール付与状況", value=role_text, inline=False)
@@ -3060,9 +3068,9 @@ nav a.current{color:#e5e7eb;font-weight:600;pointer-events:none}
 @media (min-width:640px){.wrap{padding-top:48px}.card{padding:42px 46px}h1{font-size:1.75rem}}
 """
 
-TERMS_TITLE = "【認証ボット】利用規約"
+TERMS_TITLE = "【霊夢BOT】利用規約"
 TERMS_INTRO = ("この利用規約（以下、「本規約」）は、霊夢(remuremu17)（以下、「当方」）が提供する"
-               "Discord認証ボット（以下、「本ボット」）の利用条件を定めるものです。"
+               "Discordボット「霊夢BOT」（以下、「本ボット」）の利用条件を定めるものです。"
                "本ボットを利用するすべてのユーザー（以下、「ユーザー」）は、本規約に同意したものとみなされます。")
 TERMS_SECTIONS = [
     ("第1条（適用）", [
@@ -3094,8 +3102,8 @@ TERMS_SECTIONS = [
     ]),
 ]
 
-PRIVACY_TITLE = "【認証ボット】プライバシーポリシー"
-PRIVACY_INTRO = ("霊夢(remuremu17)（以下、「当方」）は、提供するDiscord認証ボット（以下、「本ボット」）における"
+PRIVACY_TITLE = "【霊夢BOT】プライバシーポリシー"
+PRIVACY_INTRO = ("霊夢(remuremu17)（以下、「当方」）は、提供するDiscordボット「霊夢BOT」（以下、「本ボット」）における"
                  "ユーザーの個人情報の取扱いについて、以下の通りプライバシーポリシー（以下、「本ポリシー」）を定めます。")
 PRIVACY_SECTIONS = [
     ("1. 取得する情報", [
