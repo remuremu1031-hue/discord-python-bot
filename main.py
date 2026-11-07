@@ -30,7 +30,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query, Request
-from fastapi.exception_handlers import http_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, RedirectResponse
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -63,6 +63,23 @@ LOG_BUFFER: deque = deque(maxlen=int(os.getenv("LOG_BUFFER_LINES", "3000")))
 BOOT_TIME = time.time()
 
 
+_SECRET_PATTERNS = [
+    (re.compile(r"[MNO][A-Za-z\d_-]{23,27}\.[\w-]{6,7}\.[\w-]{27,40}"), "[BOTトークン伏せ字]"),
+    (re.compile(r"(?i)(bearer|bot)\s+[A-Za-z0-9._\-]{20,}"), r"\1 [伏せ字]"),
+    (re.compile(r"(?i)(access_token|refresh_token|client_secret|password|token)([\"']?\s*[:=]\s*[\"']?)[^\s\"'&,]{6,}"),
+     r"\1\2[伏せ字]"),
+    (re.compile(r"https://(discord(app)?\.com)/api/webhooks/\d+/[\w-]+"), r"https://\1/api/webhooks/[伏せ字]"),
+    (re.compile(r"rediss?://[^\s@]*@"), "redis://[伏せ字]@"),
+]
+
+
+def redact_secrets(text: str) -> str:
+    """ログに秘密情報（トークン・Webhook URL・パスワード等）が混ざっても、伏せ字にする。"""
+    for pat, rep in _SECRET_PATTERNS:
+        text = pat.sub(rep, text)
+    return text
+
+
 class _LogTee(io.TextIOBase):
     """print() や discord.py のログを、元の出力に流しつつ、メモリにも保存する。"""
 
@@ -80,7 +97,7 @@ class _LogTee(io.TextIOBase):
         while "\n" in self._partial:
             line, self._partial = self._partial.split("\n", 1)
             if line.strip():
-                LOG_BUFFER.append((time.time(), self._level, line[:2000]))
+                LOG_BUFFER.append((time.time(), self._level, redact_secrets(line[:2000])))
         return len(s)
 
     def flush(self):
@@ -651,12 +668,12 @@ KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
                  "nuke-whitelist", "subaccount", "transcript-channel", "help",
-                 "weather", "disaster", "sticky", "invite-stats", "invite-log"}  # 残すスラッシュコマンド
+                 "weather", "disaster", "sticky", "invite-stats", "invite-log", "rank", "leaderboard", "level"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
               "event_logs", "moderation", "automod",
-              "jma_alerts", "help", "sticky", "invite_tracker"]  # cogs/ フォルダの追加機能
+              "jma_alerts", "help", "sticky", "invite_tracker", "levels"]  # cogs/ フォルダの追加機能
 
 # ファイル名の別名（例: reaction_role.py でも reaction_roles として読み込む）
 COG_ALIASES = {"reaction_roles": ["reaction_role"], "event_logs": ["event_log"],
@@ -712,7 +729,10 @@ class AuthBot(commands.Bot):
             extra = dict(chunk_guilds_at_startup=False,
                          member_cache_flags=discord.MemberCacheFlags.none())
         super().__init__(command_prefix=commands.when_mentioned,
-                         intents=intents, help_command=None, tree_cls=LicenseTree, **extra)
+                         intents=intents, help_command=None, tree_cls=LicenseTree,
+                         allowed_mentions=discord.AllowedMentions(everyone=False, roles=True, users=True,
+                                                                  replied_user=False),
+                         **extra)
         self._owner_ids: set[int] | None = None
         self._status_task: asyncio.Task | None = None
 
@@ -2984,6 +3004,9 @@ def guard_check_interaction(interaction: discord.Interaction) -> str | None:
                             f"（サーバー: {interaction.guild_id or 'DM'}）")
         return "🧱 操作が多すぎるため、一時的にこのBotを利用できません。"
     if interaction.type == discord.InteractionType.application_command:
+        bad = guard_check_command_input(interaction)
+        if bad:
+            return "❌ " + bad
         name = ((interaction.data or {}).get("name") or "")
         if name in OWNER_ONLY_COMMANDS:
             guard_strike("user", uid, "owner_command",
@@ -3007,22 +3030,172 @@ async def _deny_interaction(interaction: discord.Interaction, text: str) -> None
         pass
 
 
+# ---------- Webの多層防御（入力検証・スキャナー遮断・自動化攻撃の検知・安全なエラー） ----------
+# 脆弱性スキャンで探される典型的なパス。STRONG は1回で即ブロック、WEAK は点数を加算。
+SCAN_STRONG = re.compile(
+    r"(/\.env|/\.git|/\.svn|/\.hg|/\.aws|/\.ssh|/\.docker|id_rsa|/etc/(passwd|shadow)|/proc/self|"
+    r"\.\./|\.\.\\|%2e%2e|%252e|%c0%ae|%00|/wp-(admin|login|content|includes)|xmlrpc\.php|phpmyadmin|"
+    r"/cgi-bin/|\.ht(access|passwd)|/server-status|/actuator|/vendor/phpunit|/boaform|/hnap1|/owa/|"
+    r"\.ds_store|web\.config|/config\.(json|ya?ml|php|js)|\.(sql|bak|old|swp|tar|tgz|gz|zip|7z|rar|db|sqlite)$)",
+    re.I)
+SCAN_WEAK = re.compile(r"(\.(php\d?|aspx?|jsp|cgi|pl|cfm)$|/admin|/shell|/backup|/debug|/api/v\d|/graphql|/solr|/jenkins)",
+                       re.I)
+# 攻撃コード（SQL/OSコマンド/XSS/テンプレート/Log4Shell 等）の典型的な形
+INJECTION = re.compile(
+    r"(<\s*script|javascript\s*:|vbscript\s*:|on(error|load|mouseover|focus)\s*=|<\s*(iframe|svg|img|object|embed)\b|"
+    r"\bunion\b[\s/*]+(all[\s/*]+)?\bselect\b|'\s*or\s*'?\d+'?\s*=\s*'?\d|\bor\s+1\s*=\s*1\b|\bsleep\s*\(\s*\d|"
+    r"\b(drop|truncate|alter)\s+table\b|;\s*(rm|wget|curl|bash|sh|nc|ncat|python\d?|perl|chmod|cat)\s|"
+    r"\$\([^)]*\)|`[^`]{1,80}`|\|\s*(sh|bash)\b|\$\{\s*jndi\s*:|\{\{[^}]*\}\}|<\?php|/etc/passwd)", re.I)
+INJECTION_CMD = re.compile(INJECTION.pattern.replace("|`[^`]{1,80}`", ""), re.I)
+SCANNER_UA = re.compile(
+    r"(sqlmap|nikto|nmap|masscan|zgrab|wpscan|acunetix|nuclei|dirbuster|gobuster|ffuf|feroxbuster|"
+    r"wfuzz|hydra|medusa|netsparker|burp|zap/|jaeles|whatweb|nessus|openvas|commix|xsstrike)", re.I)
+TOOL_UA = re.compile(
+    r"^$|(curl/|wget/|python-requests|python-urllib|aiohttp|httpx|go-http-client|java/|okhttp|libwww|"
+    r"scrapy|headlesschrome|phantomjs|axios/|node-fetch|postmanruntime|insomnia)", re.I)
+_BROWSER_AUTO_PATHS = re.compile(
+    r"^/(favicon\.ico|robots\.txt|sitemap\.xml|apple-touch-icon[\w-]*\.png|\.well-known/.*|manifest\.json)$")
+SENSITIVE_PATHS = ("/login", "/callback", "/dashboard/login", "/dashboard/action", "/dashboard/logout")
+ALLOWED_METHODS = {"GET", "HEAD", "POST"}
+# エンドポイントごとの、許可するクエリパラメータと形式（ここに無いパラメータは無視されるが、長さは制限）
+_DIGITS = re.compile(r"^\d{15,21}$")
+QUERY_RULES: dict[str, dict[str, re.Pattern]] = {
+    "/": {"guild": _DIGITS},
+    "/login": {"guild": _DIGITS},
+    "/callback": {"code": re.compile(r"^[A-Za-z0-9]{1,128}$"), "state": re.compile(r"^[A-Za-z0-9_\-]{1,128}$"),
+                  "guild_id": _DIGITS, "error": re.compile(r"^[a-z_]{1,64}$"),
+                  "permissions": re.compile(r"^\d{1,25}$")},
+    "/dashboard": {"tab": re.compile(r"^[a-z]{1,20}$"), "sub": re.compile(r"^(hit|clear)?$")},
+    "/dashboard/export": {"kind": re.compile(r"^(auth|incidents|logs)$")},
+}
+_fast_hits: dict[str, deque] = {}
+GUARD_POINTS.update({"scanner_strong": 6, "scanner_weak": 3, "injection": 6, "invalid_input": 2,
+                     "bad_method": 2, "tool_ua": 3, "scanner_ua": 6, "machine_speed": 3,
+                     "command_injection": 2, "not_found": 1})
+GUARD_LABEL.update({"scanner_strong": "脆弱性スキャン（機密ファイル・パストラバーサル）",
+                    "scanner_weak": "脆弱性スキャン（管理画面・スクリプトの探索）",
+                    "injection": "攻撃コードの送信（SQL/OSコマンド/XSS 等）", "invalid_input": "不正な形式の入力",
+                    "bad_method": "許可されていないHTTPメソッド", "tool_ua": "自動化ツールによる重要ページへのアクセス",
+                    "scanner_ua": "攻撃ツール（スキャナー）の使用", "machine_speed": "機械的な高速リクエスト",
+                    "command_injection": "コマンドへの攻撃コードの入力", "not_found": "存在しないページの総当たり"})
+
+
+def _plain_page(status: int, title: str, text: str) -> HTMLResponse:
+    """内部情報を一切含まない汎用ページ（result_page が使えない場面用）。"""
+    return HTMLResponse(
+        f"<!DOCTYPE html><html lang='ja'><meta charset='utf-8'><meta name='viewport' "
+        f"content='width=device-width,initial-scale=1'><title>{status}</title>"
+        f"<body style='font-family:sans-serif;background:#0b0f19;color:#e5e7eb;padding:2em'>"
+        f"<h2>{html.escape(title)}</h2><p>{html.escape(text)}</p></body></html>",
+        status_code=status, headers={"Cache-Control": "no-store"})
+
+
+def _security_headers(resp, request: Request):
+    h = resp.headers
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
+    h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    if BASE_URL.startswith("https://"):
+        h.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return resp
+
+
 @app.middleware("http")
 async def guard_middleware(request: Request, call_next):
-    """自動ブロック中の接続元は、すべてのページで 403 を返す。"""
+    """すべてのリクエストの入口。ブロック中の相手の遮断と、攻撃の兆候の検知を行う。"""
     ident = guard_web_id(request)
     request.state.guard_id = ident
     if ident and guard_blocked("ip", ident):
-        return HTMLResponse("<!DOCTYPE html><meta charset='utf-8'><title>403</title>"
-                            "<p style='font-family:sans-serif;padding:2em'>不正なアクセスが検知されたため、"
-                            "一時的にアクセスを制限しています。</p>", status_code=403,
-                            headers={"Cache-Control": "no-store"})
-    return await call_next(request)
+        return _plain_page(403, "アクセスが制限されています",
+                           "不正なアクセスが検知されたため、一時的にアクセスを制限しています。")
+    path = request.url.path
+    raw_path = (request.scope.get("raw_path") or b"").decode("latin-1", "replace")
+    query = request.url.query or ""
+    ua = request.headers.get("user-agent", "")
+
+    def stop(reason: str, status: int, title: str, text: str, detail: str = ""):
+        guard_web_strike(request, reason, detail or f"{request.method} {path[:120]}")
+        fire_and_forget(send_security_alert(GUARD_LABEL.get(reason, reason), detail or "不審なリクエストを遮断しました",
+                                            request, dedupe_key=f"{reason}:{ident}"))
+        return _security_headers(_plain_page(status, title, text), request)
+
+    # 1) メソッド・長さ
+    if request.method not in ALLOWED_METHODS:
+        return stop("bad_method", 405, "許可されていない操作です", "このリクエストは受け付けられません。")
+    if len(raw_path) > 512 or len(query) > 2048:
+        return stop("invalid_input", 414, "リクエストが長すぎます", "このリクエストは受け付けられません。")
+    # 2) 攻撃ツール・脆弱性スキャン
+    if SCANNER_UA.search(ua):
+        return stop("scanner_ua", 403, "アクセスが制限されています", "このリクエストは受け付けられません。",
+                    f"攻撃ツールのUser-Agent: {ua[:60]}")
+    if SCAN_STRONG.search(path) or SCAN_STRONG.search(raw_path):
+        return stop("scanner_strong", 404, "ページが見つかりません", "お探しのページは存在しません。", path[:120])
+    if SCAN_WEAK.search(path) and not path.startswith("/dashboard"):
+        return stop("scanner_weak", 404, "ページが見つかりません", "お探しのページは存在しません。", path[:120])
+    # 3) 攻撃コード（クエリ・URL・Referer・User-Agent）
+    try:
+        from urllib.parse import unquote_plus
+        decoded = unquote_plus(unquote_plus(query))  # 二重エンコードにも対応
+    except Exception:
+        decoded = query
+    for part in (decoded, path, request.headers.get("referer", ""), ua):
+        if part and INJECTION.search(part):
+            return stop("injection", 400, "不正なリクエストです", "このリクエストは受け付けられません。",
+                        "攻撃コードと思われる文字列を含むリクエスト")
+    # 4) クエリパラメータの形式（型・文字種・長さ）
+    rules = QUERY_RULES.get(path.rstrip("/") or "/", {})
+    for k, v in request.query_params.multi_items():
+        if len(k) > 40 or len(v) > 500 or any(ord(c) < 32 for c in k + v):
+            return stop("invalid_input", 400, "不正なリクエストです", "入力の形式が正しくありません。")
+        if k in rules and v and not rules[k].fullmatch(v):
+            return stop("invalid_input", 400, "不正なリクエストです", "入力の形式が正しくありません。",
+                        f"パラメータ {k} の形式が不正")
+    # 5) 重要ページへの自動化アクセス・機械的な高速リクエスト
+    if path in SENSITIVE_PATHS:
+        if TOOL_UA.search(ua):
+            return stop("tool_ua", 403, "アクセスが制限されています", "ブラウザからアクセスしてください。",
+                        f"自動化ツールのUser-Agent: {ua[:60] or '(なし)'}")
+        if ident:
+            now = time.time()
+            dq = _fast_hits.setdefault(ident, deque(maxlen=20))
+            dq.append(now)
+            while dq and now - dq[0] > 5:
+                dq.popleft()
+            if len(dq) >= 6:  # 5秒間に6回以上 = 人間の操作では起きにくい速さ
+                dq.clear()
+                guard_web_strike(request, "machine_speed", f"{path} に5秒間で6回以上")
+            if len(_fast_hits) > 5000:
+                _fast_hits.clear()
+    # 6) POSTの本文は大きさだけ確認（中身はダッシュボード側で項目ごとに形式を検証している）
+    if request.method == "POST" and int(request.headers.get("content-length") or 0) > 20000:
+        return stop("invalid_input", 413, "リクエストが大きすぎます", "このリクエストは受け付けられません。")
+    resp = await call_next(request)
+    return _security_headers(resp, request)
 
 
 def guard_web_strike(request: Request, reason: str, detail: str = "") -> None:
     guard_strike("ip", getattr(request.state, "guard_id", None) or guard_web_id(request), reason,
                  request=request, detail=detail)
+
+
+def guard_check_command_input(interaction: discord.Interaction) -> str | None:
+    """スラッシュコマンドの文字列引数を検査する（制御文字・異常な長さ・攻撃コード）。"""
+    def walk(opts):
+        for o in opts or []:
+            if "options" in o:
+                yield from walk(o["options"])
+            elif isinstance(o.get("value"), str):
+                yield o.get("name", ""), o["value"]
+    for name, val in walk((interaction.data or {}).get("options")):
+        if len(val) > 4000 or any(ord(c) < 32 and c not in "\n\t" for c in val):
+            return f"引数 `{name}` に使えない文字が含まれています。"
+        if INJECTION_CMD.search(val):
+            guard_strike("user", interaction.user.id, "command_injection",
+                         detail=f"/{(interaction.data or {}).get('name')} の {name} に攻撃コードと思われる入力")
+            return f"引数 `{name}` に、使用できない文字列（スクリプト・コマンド等）が含まれています。"
+    return None
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -3039,23 +3212,42 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 @app.exception_handler(StarletteHTTPException)
 async def http_error_handler(request: Request, exc: StarletteHTTPException):
-    # 脆弱性スキャンのような不審なパスへのアクセスを通知する（応答は今まで通り）
-    if exc.status_code == 404 and _SUSPICIOUS_PATH.search(request.url.path):
-        fire_and_forget(send_security_alert(
-            "不審なパスへのアクセス", "存在しない管理系・設定系のパスにアクセスがありました",
-            request))
-        guard_web_strike(request, "suspicious_path", request.url.path[:100])
-    return await http_exception_handler(request, exc)
+    """HTTPエラーは、内部情報を含まない汎用ページで返す（FastAPI標準のJSON詳細は返さない）。"""
+    if exc.status_code == 404:
+        if not _BROWSER_AUTO_PATHS.match(request.url.path):  # ブラウザが自動で取りに来るものは数えない
+            guard_web_strike(request, "not_found", request.url.path[:100])  # 総当たりの探索を点数化
+        if _SUSPICIOUS_PATH.search(request.url.path):
+            fire_and_forget(send_security_alert(
+                "不審なパスへのアクセス", "存在しない管理系・設定系のパスにアクセスがありました", request))
+        return _security_headers(_plain_page(404, "ページが見つかりません", "お探しのページは存在しません。"), request)
+    if exc.status_code == 405:
+        return _security_headers(_plain_page(405, "許可されていない操作です", "このリクエストは受け付けられません。"), request)
+    return _security_headers(_plain_page(exc.status_code, "リクエストを処理できません",
+                                         "時間をおいて、もう一度お試しください。"), request)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """入力の型が不正（FastAPI標準では入力値をそのまま返してしまうので、汎用ページにする）。"""
+    guard_web_strike(request, "invalid_input", f"{request.url.path[:100]} の入力形式エラー")
+    return _security_headers(_plain_page(400, "不正なリクエストです", "入力の形式が正しくありません。"), request)
 
 
 @app.exception_handler(Exception)
 async def unhandled_error_handler(request: Request, exc: Exception):
+    """想定外のエラー。利用者には「エラーID」だけを見せ、詳細はサーバーのログにだけ残す。"""
+    import traceback
+    err_id = secrets.token_hex(4)
+    tb = traceback.extract_tb(exc.__traceback__)
+    where = f"{Path(tb[-1].filename).name}:{tb[-1].lineno} ({tb[-1].name})" if tb else "-"
+    print(f"[エラーID {err_id}] {request.method} {request.url.path} で {type(exc).__name__} が発生\n"
+          + redact_secrets("".join(traceback.format_exception(type(exc), exc, exc.__traceback__))))
     fire_and_forget(send_security_alert(
-        "重大なエラー（500）",
-        f"処理中に {type(exc).__name__} が発生しました（詳細はサーバーのログを確認）",
-        request, level="critical", dedupe_key="error-500"))
-    return result_page(False, "エラーが発生しました",
-                       "時間をおいて、もう一度お試しください。", status=500)
+        "重大なエラー（500）", f"エラーID {err_id}: {type(exc).__name__}（発生箇所 {where}）。"
+        "詳細はサーバーのログをエラーIDで検索してください", request, level="critical", dedupe_key="error-500"))
+    return _security_headers(result_page(False, "エラーが発生しました",
+                                         f"時間をおいて、もう一度お試しください。（エラーID: {err_id}）",
+                                         status=500), request)
 
 
 # ---------- 認証ログ ----------
@@ -3825,6 +4017,7 @@ if __name__ == "__main__":
                          ("security_blocks", SEC_BLOCK_FILE),
                          ("weather_config", Path("weather_config.json")),
                          ("invite_log_config", Path("invite_log_config.json")),
+                         ("level_config", Path("level_config.json")),
                          ("disaster_config", Path("disaster_config.json"))])
     except Exception as e:
         raise SystemExit("設定の読み込みに失敗しました（Upstashに接続できません）: "
@@ -3854,4 +4047,4 @@ if __name__ == "__main__":
         raise SystemExit("REDIRECT_URI が決まりません。トンネルの起動に失敗したか、"
                          ".env に REDIRECT_URI を設定してください。")
     print(f"所有者専用ダッシュボード: {BASE_URL}/dashboard（ログインは認証と同じ {REDIRECT_URI} を使用）")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, server_header=False)  # サーバーの種類・版を返さない

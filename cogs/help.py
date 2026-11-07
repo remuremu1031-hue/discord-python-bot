@@ -11,10 +11,17 @@ CATEGORIES = [
     ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "mass_role"]),
     ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "invite-log", "invite-stats", "weather",
                     "disaster", "broadcast-channel", "help"]),
+    ("📈 レベル・ランク", ["rank", "leaderboard", "level"]),
     ("👑 オーナー専用", ["broadcast", "blacklist", "license", "gban"]),
 ]
 OWNER_CAT = "👑 オーナー専用"
 GUIDE = {
+    "rank": "メッセージ送信（1分ごと）とVC参加（1分ごと）で経験値が貯まり、レベルが上がります。"
+            "`/rank` でレベル・順位・次のレベルまでの進捗バー・次のランクまでのXP・活動量を表示します。",
+    "leaderboard": "サーバー内のレベル上位15人と、自分の順位を表示します。",
+    "level": "（管理者）`settings` でON/OFF・通知先・XP倍率、`role` でレベル到達時のランクロール、"
+             "`no-xp` でXP対象外のチャンネル、`set` でレベルの変更・リセット。\n"
+             "※ VCのXPは、2人以上いるVCでミュートしていない人だけが対象です",
     "sticky": "① `/sticky set text:本文` で登録（`title` を入れると埋め込み、`button_label`+`button_url` でリンクボタン）\n"
               "② 誰かが投稿するたびに、古い案内を消して一番下に貼り直します\n"
               "・`/sticky copy message_id:ID` で既存メッセージを流用 ・`/sticky remove` で解除 ・`/sticky list` で一覧",
@@ -96,7 +103,8 @@ class HelpCog(commands.Cog):
                                       "**はじめに**\n"
                                       "・認証の設置: `/setup` → `/panel`\n"
                                       "・荒らし対策: `/nuke-defense` → `/set-log-channel`\n"
-                                      "・案内を一番下に固定: `/sticky set`")
+                                      "・案内を一番下に固定: `/sticky set`\n"
+                                      "・レベル・ランク: `/rank` ／ 設定は `/level`")
         for cat, names in CATEGORIES:
             if cat == OWNER_CAT and not is_owner:
                 continue
