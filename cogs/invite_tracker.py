@@ -1,0 +1,212 @@
+"""招待リンクの追跡。
+・招待リンクの作成を検知し、URL・有効期限・作成者の累計作成回数をログチャンネルへ記録
+・メンバー参加時に「どの招待リンク（誰がいつ作成）」から来たかを特定してログに出し、Redisに保存
+  → main.py の認証ログが bot.get_join_invite() で読み出して表示する
+Redis キー:
+  invcount:<サーバーID>:<ユーザーID>   … そのユーザーが作成した招待リンクの累計数
+  invjoin:<サーバーID>:<ユーザーID>    … 参加に使った招待リンクの情報（90日保持）
+  invmeta:<サーバーID>:<コード>        … 招待リンクの作成者・作成日時（期限切れ後も分かるように）
+※ Botに「サーバーの管理」権限が必要（招待一覧の取得のため）。メンバー参加の検知には
+  SERVER MEMBERS INTENT（ENABLE_MEMBERS_INTENT=1）が必要。"""
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+import redis_kv as kv
+
+JST = timezone(timedelta(hours=9))
+JOIN_TTL = 90 * 86400
+
+
+def _fmt(dt: datetime | None) -> str:
+    return dt.astimezone(JST).strftime("%Y/%m/%d %H:%M") if dt else "不明"
+
+
+class InviteTracker(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self._cache: dict[int, dict[str, dict]] = {}  # サーバー → コード → {"uses","inviter","inviter_name","created","max_uses"}
+        bot.get_join_invite = self.get_join_invite  # main.py から使う窓口
+        bot.describe_invite = self.describe
+
+    # ---------- 招待一覧のキャッシュ ----------
+    @staticmethod
+    def _snap(inv: discord.Invite) -> dict:
+        return {"uses": inv.uses or 0, "max_uses": inv.max_uses or 0,
+                "inviter": inv.inviter.id if inv.inviter else None,
+                "inviter_name": str(inv.inviter) if inv.inviter else None,
+                "created": inv.created_at.timestamp() if inv.created_at else None,
+                "expires": inv.expires_at.timestamp() if inv.expires_at else None}
+
+    async def _refresh(self, guild: discord.Guild) -> dict[str, dict] | None:
+        if not guild.me.guild_permissions.manage_guild:
+            return None
+        try:
+            invites = await guild.invites()
+        except discord.HTTPException:
+            return None
+        snap = {i.code: self._snap(i) for i in invites}
+        if "VANITY_URL" in guild.features:
+            try:
+                v = await guild.vanity_invite()
+                if v:
+                    snap["__vanity__"] = {"uses": v.uses or 0, "code": v.code}
+            except discord.HTTPException:
+                pass
+        return snap
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        for g in list(self.bot.guilds):
+            snap = await self._refresh(g)
+            if snap is not None:
+                self._cache[g.id] = snap
+                await self._seed(g, snap)
+            await asyncio.sleep(0.5)
+
+    async def _seed(self, guild: discord.Guild, snap: dict[str, dict]):
+        """記録前から存在する招待リンクも、作成者の累計数に1回ずつ数える（初回のみ）。"""
+        for code, d in snap.items():
+            if code == "__vanity__" or not d.get("inviter"):
+                continue
+            mk = f"invmeta:{guild.id}:{code}"
+            if await kv.get_json(self.bot, mk):
+                continue
+            await kv.set_json(self.bot, mk, {"inviter": d["inviter"], "inviter_name": d["inviter_name"],
+                                             "created": d["created"]}, ttl=JOIN_TTL * 2)
+            await kv.incr(self.bot, f"invcount:{guild.id}:{d['inviter']}")
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild):
+        snap = await self._refresh(guild)
+        if snap is not None:
+            self._cache[guild.id] = snap
+
+    @commands.Cog.listener()
+    async def on_invite_delete(self, invite: discord.Invite):
+        if invite.guild:
+            self._cache.get(invite.guild.id, {}).pop(invite.code, None)
+
+    # ---------- 作成の検知 ----------
+    @commands.Cog.listener()
+    async def on_invite_create(self, invite: discord.Invite):
+        guild = invite.guild
+        if not isinstance(guild, discord.Guild):
+            return
+        s = self._snap(invite)
+        self._cache.setdefault(guild.id, {})[invite.code] = s
+        await kv.set_json(self.bot, f"invmeta:{guild.id}:{invite.code}",
+                          {"inviter": s["inviter"], "inviter_name": s["inviter_name"], "created": s["created"]},
+                          ttl=JOIN_TTL * 2)
+        count = await kv.incr(self.bot, f"invcount:{guild.id}:{s['inviter']}") if s["inviter"] else 0
+        if invite.max_age:
+            exp = f"{_fmt(invite.expires_at)}（{self._age(invite.max_age)}）"
+        else:
+            exp = "無期限"
+        e = discord.Embed(title="🔗 招待リンクが作成されました", color=0x3B82F6,
+                          timestamp=datetime.now(timezone.utc))
+        e.add_field(name="URL", value=invite.url, inline=False)
+        e.add_field(name="作成者", value=f"<@{s['inviter']}>（`{s['inviter_name']}` / `{s['inviter']}`）"
+                    if s["inviter"] else "不明", inline=False)
+        e.add_field(name="有効期限", value=exp, inline=True)
+        e.add_field(name="使用回数の上限", value=f"{invite.max_uses}回" if invite.max_uses else "無制限", inline=True)
+        e.add_field(name="チャンネル", value=getattr(invite.channel, "mention", "-"), inline=True)
+        if invite.temporary:
+            e.add_field(name="一時メンバー", value="はい（切断すると退出）", inline=True)
+        e.add_field(name="この人の累計作成数", value=f"**{count}** 回", inline=True)
+        await self._log(guild, e)
+
+    @staticmethod
+    def _age(sec: int) -> str:
+        if sec % 86400 == 0:
+            return f"{sec // 86400}日"
+        if sec % 3600 == 0:
+            return f"{sec // 3600}時間"
+        return f"{sec // 60}分"
+
+    async def _log(self, guild: discord.Guild, embed: discord.Embed):
+        fn = getattr(self.bot, "guild_log", None)
+        if fn:
+            try:
+                await fn(guild, embed)
+            except Exception as e:
+                print(f"招待ログの送信に失敗: {type(e).__name__}")
+
+    # ---------- 参加時の特定 ----------
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        guild = member.guild
+        before = self._cache.get(guild.id, {})
+        after = await self._refresh(guild)
+        if after is None:
+            return
+        self._cache[guild.id] = after
+        used = None
+        for code, a in after.items():
+            b = before.get(code)
+            if code != "__vanity__" and b and a["uses"] > b["uses"]:
+                used = (code, a)
+                break
+        if used is None and "__vanity__" in after and after["__vanity__"]["uses"] > before.get("__vanity__", {}).get("uses", 0):
+            used = (after["__vanity__"].get("code", "vanity"), {"inviter": None, "inviter_name": "カスタム招待URL", "created": None})
+        if used is None:  # 使用回数1回のリンクは、使われると消える
+            gone = [c for c in before if c not in after and c != "__vanity__"
+                    and before[c].get("max_uses") and before[c]["uses"] + 1 >= before[c]["max_uses"]]
+            if len(gone) == 1:
+                used = (gone[0], before[gone[0]])
+        info = {"code": None, "inviter": None, "inviter_name": None, "created": None}
+        if used:
+            code, d = used
+            meta = await kv.get_json(self.bot, f"invmeta:{guild.id}:{code}", {}) or {}
+            info = {"code": code, "inviter": d.get("inviter") or meta.get("inviter"),
+                    "inviter_name": d.get("inviter_name") or meta.get("inviter_name"),
+                    "created": d.get("created") or meta.get("created")}
+        await kv.set_json(self.bot, f"invjoin:{guild.id}:{member.id}", info, ttl=JOIN_TTL)
+
+        e = discord.Embed(title="📥 メンバーが参加しました", color=0x22C55E, timestamp=datetime.now(timezone.utc))
+        e.set_thumbnail(url=member.display_avatar.url)
+        e.add_field(name="メンバー", value=f"{member.mention}（`{member}` / `{member.id}`）", inline=False)
+        e.add_field(name="アカウント作成日", value=_fmt(member.created_at), inline=True)
+        for n, v in self.describe(info):
+            e.add_field(name=n, value=v, inline=n != "招待リンク")
+        await self._log(guild, e)
+
+    @staticmethod
+    def describe(info: dict | None) -> list[tuple[str, str]]:
+        """認証ログ等に載せる (項目名, 内容) のリスト。"""
+        if not info or not info.get("code"):
+            return [("招待リンク", "不明（OAuth2認証による参加・権限不足・同時参加などで特定できません）")]
+        created = (datetime.fromtimestamp(info["created"], JST).strftime("%Y/%m/%d %H:%M")
+                   if info.get("created") else "不明")
+        who = (f"<@{info['inviter']}>（`{info.get('inviter_name')}` / `{info['inviter']}`）"
+               if info.get("inviter") else (info.get("inviter_name") or "不明"))
+        return [("招待リンク", f"`discord.gg/{info['code']}`"), ("招待の作成者", who), ("招待の作成日時", created)]
+
+    async def get_join_invite(self, guild_id: int, user_id: int) -> dict | None:
+        return await kv.get_json(self.bot, f"invjoin:{guild_id}:{user_id}")
+
+    # ---------- 確認用コマンド ----------
+    @app_commands.command(name="invite-stats", description="ユーザーが作成した招待リンクの累計数と、今有効なリンクを表示します")
+    @app_commands.describe(user="対象ユーザー（省略で自分）")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def invite_stats(self, interaction: discord.Interaction, user: discord.User | None = None):
+        user = user or interaction.user
+        total = await kv.get_int(self.bot, f"invcount:{interaction.guild_id}:{user.id}")
+        active = [(c, d) for c, d in self._cache.get(interaction.guild_id, {}).items()
+                  if c != "__vanity__" and d.get("inviter") == user.id]
+        lines = [f"・`discord.gg/{c}` 使用 {d['uses']}回" + (f"/{d['max_uses']}" if d["max_uses"] else "")
+                 for c, d in active[:15]]
+        e = discord.Embed(title=f"🔗 {user} の招待リンク", color=0x3B82F6,
+                          description=f"累計作成数: **{total}** 回（記録開始以降）\n有効なリンク: {len(active)} 件\n"
+                                      + "\n".join(lines))
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(InviteTracker(bot))
