@@ -2,8 +2,10 @@ import asyncio
 import atexit
 import copy
 import hashlib
+import hmac
 import html
 import io
+import ipaddress
 import json
 import logging
 import math
@@ -12,8 +14,10 @@ import platform
 import re
 import secrets
 import subprocess
+import sys
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +40,52 @@ try:
 except ImportError:  # 未インストールなら、GBAN機能だけが無効になる
     aioredis = None
 
+import dashboard  # 所有者専用Webダッシュボード（dashboard.py）
+import transcript  # チケットのトランスクリプト生成（transcript.py）
+
+
+# ---------- Botのログをメモリにも残す（ダッシュボードで閲覧するため） ----------
+LOG_BUFFER: deque = deque(maxlen=int(os.getenv("LOG_BUFFER_LINES", "3000")))
+BOOT_TIME = time.time()
+
+
+class _LogTee(io.TextIOBase):
+    """print() や discord.py のログを、元の出力に流しつつ、メモリにも保存する。"""
+
+    def __init__(self, stream, level: str):
+        self._stream = stream
+        self._level = level
+        self._partial = ""
+
+    def write(self, s):
+        try:
+            self._stream.write(s)
+        except Exception:
+            pass
+        self._partial += s
+        while "\n" in self._partial:
+            line, self._partial = self._partial.split("\n", 1)
+            if line.strip():
+                LOG_BUFFER.append((time.time(), self._level, line[:2000]))
+        return len(s)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return False
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+sys.stdout = _LogTee(sys.stdout, "OUT")
+sys.stderr = _LogTee(sys.stderr, "ERR")
+
 load_dotenv()
 
 # ---------- 設定 ----------
@@ -45,7 +95,27 @@ BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 REDIRECT_URI = os.getenv("REDIRECT_URI", "")  # クイックトンネル使用時は起動時に自動設定される
 PORT = int(os.getenv("PORT", "8080"))
 USE_QUICK_TUNNEL = os.getenv("USE_QUICK_TUNNEL", "1") != "0"  # 0で無効化
-MIN_ACCOUNT_AGE_DAYS = int(os.getenv("MIN_ACCOUNT_AGE_DAYS", "3"))  # これ未満は認証しない
+# --- IPアドレスによるサブアカウント検知（旧「作成3日以内＝サブ垢」の判定は廃止） ---
+IP_RETENTION_DAYS = int(os.getenv("IP_RETENTION_DAYS", "90"))  # IPの記録を保持する日数
+STORE_RAW_IP = os.getenv("STORE_RAW_IP", "0") == "1"  # 1で生のIPも保存（既定はハッシュ＋一部伏せ字のみ）
+IP_HASH_KEY = (os.getenv("IP_HASH_KEY") or "").encode() or hashlib.sha256(
+    ("ip-hash:" + os.environ["DISCORD_CLIENT_SECRET"]).encode()).digest()  # 再起動しても変わらない鍵
+SUBACCOUNT_DEFAULT_ACTION = os.getenv("SUBACCOUNT_DEFAULT_ACTION", "block")  # block / log
+# --- Nuke / Raid 対策 ---
+NUKE_WINDOW = int(os.getenv("NUKE_WINDOW_SECONDS", "10"))  # この秒数の間に…
+NUKE_LIMITS = {  # …この回数を超えたら、実行者をNukeとみなす
+    "channel_delete": int(os.getenv("NUKE_CHANNEL_DELETE", "3")),
+    "channel_create": int(os.getenv("NUKE_CHANNEL_CREATE", "6")),
+    "role_delete": int(os.getenv("NUKE_ROLE_DELETE", "3")),
+    "role_create": int(os.getenv("NUKE_ROLE_CREATE", "6")),
+    "ban": int(os.getenv("NUKE_BAN", "3")),
+    "kick": int(os.getenv("NUKE_KICK", "3")),
+    "webhook_create": int(os.getenv("NUKE_WEBHOOK_CREATE", "4")),
+    "prune": 1,
+}
+RAID_JOIN_THRESHOLD = int(os.getenv("RAID_JOIN_THRESHOLD", "10"))  # この人数が…
+RAID_JOIN_WINDOW = int(os.getenv("RAID_JOIN_WINDOW", "15"))  # …この秒数以内に参加したらRaid
+RAID_LOCK_MINUTES = int(os.getenv("RAID_LOCK_MINUTES", "10"))  # Raidモードを続ける分数
 SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "1") != "0"  # 0にするとスラッシュコマンドの同期をしない（複数台で動かすときの副環境用）
 PURGE_OLD_COMMANDS = os.getenv("PURGE_OLD_COMMANDS", "0") == "1"  # 1にすると起動時に不要なコマンドを削除
 WATCHDOG_SECONDS = int(os.getenv("WATCHDOG_SECONDS", "300"))  # Botがこの秒数オフラインならプロセスを終了（ホスト側が再起動）。0で無効
@@ -74,6 +144,13 @@ LICENSE_FILE = Path("license_suspended.json")  # ライセンス停止中のサ�
 STATUS_FILE = Path("status_message.json")  # 稼働状況メッセージのID
 DEFENSE_CONFIG_FILE = Path("defense_config.json")  # Nuke防衛・招待リンクブロックの設定
 BACKUP_DATA_FILE = Path("server_backups.json")  # サーバーバックアップ
+IP_INDEX_FILE = Path("ip_index.json")  # 認証時のIP（ハッシュ）とアカウントの対応
+AUTH_LOG_FILE = Path("auth_logs.json")  # 認証ログ（ダッシュボード用）
+INCIDENT_FILE = Path("security_incidents.json")  # Nuke/Raid検知の履歴
+TICKET_CONFIG_FILE = Path("ticket_config.json")  # トランスクリプトの送信先
+SUBACCOUNT_CONFIG_FILE = Path("subaccount_config.json")  # サブアカウント検知時の動作
+AUTH_LOG_MAX = 500
+INCIDENT_MAX = 300
 INDEX_PATH = Path(__file__).parent / "index.html"  # main.pyと同じフォルダのindex.html
 JST = timezone(timedelta(hours=9))
 WEEKDAYS = "月火水木金土日"
@@ -254,11 +331,25 @@ def load_license() -> dict[str, dict]:
 
 
 def save_license(data: dict[str, dict]) -> None:
+    global _suspended_cache
     storage.save("license", LICENSE_FILE, data)
+    _suspended_cache = (0.0, frozenset())  # すぐに反映する
+
+
+_suspended_cache: tuple[float, frozenset] = (0.0, frozenset())
+
+
+def suspended_guild_ids() -> frozenset:
+    """停止中のサーバーID（イベントごとに呼ばれるので、2秒だけキャッシュする）。"""
+    global _suspended_cache
+    now = time.monotonic()
+    if now - _suspended_cache[0] > 2:
+        _suspended_cache = (now, frozenset(int(k) for k in load_license()))
+    return _suspended_cache[1]
 
 
 def is_license_suspended(guild_id: int) -> bool:
-    return str(guild_id) in load_license()
+    return int(guild_id or 0) in suspended_guild_ids()
 
 
 # ---------- Nuke防衛・バックアップの設定 ----------
@@ -290,6 +381,115 @@ def load_backups() -> dict:
 
 def save_backups(data: dict) -> None:
     storage.save("server_backups", BACKUP_DATA_FILE, data)
+
+
+# ---------- IPアドレスの記録（サブアカウント検知・GBAN/ブラックリスト連携） ----------
+def normalize_ip(raw: str) -> str | None:
+    """照合に使う形へ。IPv6は同じ回線でも末尾が変わるので /64 単位にまとめる。
+    プライベート・ループバックなど、本人を表さないアドレスは None（判定に使わない）。"""
+    try:
+        ip = ipaddress.ip_address((raw or "").strip())
+    except ValueError:
+        return None
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified \
+            or ip.is_multicast or ip.is_reserved:
+        return None
+    if ip.version == 6:
+        if ip.ipv4_mapped:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+    return str(ip)
+
+
+def ip_hash(norm_ip: str) -> str:
+    """IPの鍵付きハッシュ（同じIPかどうかは分かるが、元のIPには戻せない）。"""
+    return hmac.new(IP_HASH_KEY, norm_ip.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def mask_ip(norm_ip: str) -> str:
+    """表示用に一部を伏せたIP（例: 203.0.113.xxx / 2001:db8:1234::/64 → 2001:db8:xxxx::/64）。"""
+    if ":" in norm_ip:
+        head = norm_ip.split(":")
+        return ":".join(head[:2]) + ":xxxx::/64"
+    p = norm_ip.split(".")
+    return ".".join(p[:3]) + ".xxx" if len(p) == 4 else "?"
+
+
+def load_ip_index() -> dict:
+    """-> {"ハッシュ": {"m": 伏せ字IP, "raw": 生IP(任意), "e": [{"u": ユーザーID, "g": サーバーID, "t": 時刻}]}}"""
+    return storage.load("ip_index", IP_INDEX_FILE)
+
+
+def _prune_ip_index(data: dict) -> dict:
+    cutoff = time.time() - IP_RETENTION_DAYS * 86400
+    out = {}
+    for h, rec in data.items():
+        ents = [e for e in rec.get("e", []) if e.get("t", 0) >= cutoff][-40:]
+        if ents:
+            rec["e"] = ents
+            out[h] = rec
+    if len(out) > 5000:  # 保存サイズが増えすぎないよう、最近使われたものだけ残す
+        keep = sorted(out.items(), key=lambda kv: kv[1]["e"][-1]["t"], reverse=True)[:5000]
+        out = dict(keep)
+    return out
+
+
+def record_ip(h: str, norm_ip: str, uid: int, gid: int) -> None:
+    data = load_ip_index()
+    rec = data.setdefault(h, {"e": []})
+    rec["m"] = mask_ip(norm_ip)
+    if STORE_RAW_IP:
+        rec["raw"] = norm_ip
+    else:
+        rec.pop("raw", None)
+    # 同じユーザー・同じサーバーの古い記録は、最新のものに置き換える
+    rec["e"] = [e for e in rec.get("e", []) if not (e.get("u") == uid and e.get("g") == gid)]
+    rec["e"].append({"u": uid, "g": gid, "t": int(time.time())})
+    storage.save("ip_index", IP_INDEX_FILE, _prune_ip_index(data))
+
+
+def ip_linked_users(h: str, uid: int) -> dict[int, set[int]]:
+    """同じIPから認証した、本人以外のユーザー -> {ユーザーID: {サーバーID...}}"""
+    cutoff = time.time() - IP_RETENTION_DAYS * 86400
+    out: dict[int, set[int]] = {}
+    for e in load_ip_index().get(h, {}).get("e", []):
+        if e.get("u") != uid and e.get("t", 0) >= cutoff:
+            out.setdefault(int(e["u"]), set()).add(int(e["g"]))
+    return out
+
+
+def user_ip_hashes(uid: int) -> list[str]:
+    return [h for h, rec in load_ip_index().items()
+            if any(e.get("u") == uid for e in rec.get("e", []))]
+
+
+def get_subaccount_action(guild_id: int) -> str:
+    v = storage.load("subaccount_config", SUBACCOUNT_CONFIG_FILE).get(str(guild_id))
+    return v if v in ("block", "log") else SUBACCOUNT_DEFAULT_ACTION
+
+
+# ---------- 認証ログ・セキュリティ事案の履歴（ダッシュボード用） ----------
+def append_auth_log(entry: dict) -> None:
+    data = storage.load("auth_logs", AUTH_LOG_FILE)
+    items = data.get("items", [])
+    items.append(entry)
+    storage.save("auth_logs", AUTH_LOG_FILE, {"items": items[-AUTH_LOG_MAX:]})
+
+
+def load_auth_logs() -> list[dict]:
+    return storage.load("auth_logs", AUTH_LOG_FILE).get("items", [])
+
+
+def record_incident(entry: dict) -> None:
+    data = storage.load("security_incidents", INCIDENT_FILE)
+    items = data.get("items", [])
+    entry.setdefault("t", int(time.time()))
+    items.append(entry)
+    storage.save("security_incidents", INCIDENT_FILE, {"items": items[-INCIDENT_MAX:]})
+
+
+def load_incidents() -> list[dict]:
+    return storage.load("security_incidents", INCIDENT_FILE).get("items", [])
 
 
 BROADCAST_WARNING = (
@@ -332,6 +532,54 @@ class LicenseTree(app_commands.CommandTree):
         return False
 
 
+def get_transcript_channel_id(guild_id: int) -> int | None:
+    v = storage.load("ticket_config", TICKET_CONFIG_FILE).get(str(guild_id), {})
+    cid = v.get("transcript_channel") if isinstance(v, dict) else None
+    return int(cid) if cid else None
+
+
+async def save_ticket_transcript(channel: discord.TextChannel, saved_by: discord.abc.User,
+                                 *, reason: str = "手動保存") -> tuple[list[discord.File], str]:
+    """チケットの会話をHTMLとテキストにまとめ、設定された送信先チャンネルへ送る。
+    戻り値: (保存者へ渡すファイル, 結果メッセージ)"""
+    messages = [m async for m in channel.history(limit=5000, oldest_first=True)]
+    html_text = transcript.build_html(channel, messages, saved_by=saved_by,
+                                      bot_name=bot.user.name if bot.user else "Bot")
+    txt_text = transcript.build_text(channel, messages, saved_by=saved_by)
+    base = re.sub(r"[^\w.-]", "_", channel.name)[:60] or "ticket"
+    stamp = datetime.now(JST).strftime("%Y%m%d-%H%M")
+
+    def files() -> list[discord.File]:
+        return [discord.File(io.BytesIO(html_text.encode("utf-8")),
+                             filename=f"transcript-{base}-{stamp}.html"),
+                discord.File(io.BytesIO(txt_text.encode("utf-8")),
+                             filename=f"transcript-{base}-{stamp}.txt")]
+
+    participants: dict[int, discord.abc.User] = {}
+    for m in messages:
+        participants.setdefault(m.author.id, m.author)
+    result = "送信先チャンネルが未設定のため、あなたにだけ送りました（`/transcript-channel` で設定できます）。"
+    cid = get_transcript_channel_id(channel.guild.id)
+    dest = channel.guild.get_channel(cid) if cid else None
+    if isinstance(dest, discord.TextChannel) and dest.id != channel.id:
+        embed = discord.Embed(title="📝 チケットのトランスクリプト", color=0x5865F2,
+                              timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="チケット", value=f"#{channel.name}（`{channel.id}`）", inline=False)
+        embed.add_field(name="保存者", value=f"{saved_by.mention}（`{saved_by.id}`）", inline=True)
+        embed.add_field(name="理由", value=reason, inline=True)
+        embed.add_field(name="メッセージ数", value=f"{len(messages)} 件", inline=True)
+        plist = " ".join(u.mention for u in list(participants.values())[:30]) or "-"
+        embed.add_field(name=f"参加者（{len(participants)}人）", value=plist[:1000], inline=False)
+        embed.set_footer(text="HTMLファイルをダウンロードしてブラウザで開くと、会話をきれいに表示できます")
+        try:
+            await dest.send(embed=embed, files=files(),
+                            allowed_mentions=discord.AllowedMentions.none())
+            result = f"{dest.mention} に保存しました。"
+        except discord.HTTPException as e:
+            result = f"{dest.mention} への送信に失敗しました（{safe_error(e)}）。あなたにだけ送ります。"
+    return files(), result
+
+
 class TicketControlView(discord.ui.View):
     """チケットのトランスクリプト保存・削除ボタン（永続View）。"""
 
@@ -347,18 +595,14 @@ class TicketControlView(discord.ui.View):
     @discord.ui.button(label="トランスクリプト保存", style=discord.ButtonStyle.primary,
                        custom_id="ticket_transcript", emoji="📝", row=0)
     async def transcript_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        messages = [msg async for msg in interaction.channel.history(limit=2000, oldest_first=True)]
-        log_content = f"=== チケットログ: {interaction.channel.name} ===\n"
-        log_content += f"作成日時: {discord.utils.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        for msg in messages:
-            timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            log_content += f"[{timestamp}] {msg.author} (ID: {msg.author.id}): {msg.content}\n"
-            for att in msg.attachments:
-                log_content += f"  [添付ファイル: {att.url}]\n"
-        file = discord.File(io.BytesIO(log_content.encode("utf-8")),
-                            filename=f"transcript-{interaction.channel.name}.txt")
-        await interaction.followup.send("📝 チケットのトランスクリプトを作成しました。", file=file, ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            files, result = await save_ticket_transcript(interaction.channel, interaction.user)
+        except discord.Forbidden:
+            await interaction.followup.send("❌ メッセージ履歴を読む権限がありません。", ephemeral=True)
+            return
+        await interaction.followup.send(f"📝 トランスクリプトを作成しました。{result}",
+                                        files=files, ephemeral=True)
 
     @discord.ui.button(label="チケット削除", style=discord.ButtonStyle.danger,
                        custom_id="ticket_delete", emoji="🗑️", row=0)
@@ -366,7 +610,13 @@ class TicketControlView(discord.ui.View):
         if not interaction.user.guild_permissions.manage_channels:
             await interaction.response.send_message("❌ このボタンを押す権限がありません。", ephemeral=True)
             return
-        await interaction.response.send_message("🗑️ 3秒後にこのチャンネルを削除します...", ephemeral=True)
+        await interaction.response.send_message("🗑️ トランスクリプトを保存して、まもなくこのチャンネルを削除します...",
+                                                ephemeral=True)
+        if get_transcript_channel_id(interaction.guild_id or 0):  # 送信先があれば、削除前に自動保存
+            try:
+                await save_ticket_transcript(interaction.channel, interaction.user, reason="削除前の自動保存")
+            except Exception as e:
+                print(f"削除前のトランスクリプト保存に失敗: {safe_error(e)}")
         await asyncio.sleep(3)
         try:
             await interaction.channel.delete(reason=f"チケット削除: {interaction.user}")
@@ -376,11 +626,51 @@ class TicketControlView(discord.ui.View):
 
 KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license", "gban", "set-log-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
-                 "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup"}  # 残すスラッシュコマンド
+                 "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
+                 "nuke-whitelist", "subaccount", "transcript-channel", "help",
+                 "weather", "disaster"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
-              "event_logs", "moderation", "automod"]  # cogs/ フォルダの追加機能
+              "event_logs", "moderation", "automod",
+              "jma_alerts", "help"]  # cogs/ フォルダの追加機能
+
+# ライセンス停止中でも止めないイベント（Bot自体の接続・サーバーの出入りなど）
+LICENSE_EXEMPT_EVENTS = {
+    "ready", "connect", "disconnect", "resumed", "shard_connect", "shard_disconnect",
+    "shard_ready", "shard_resumed", "guild_join", "guild_remove", "guild_available",
+    "guild_unavailable", "guild_update", "socket_event_type", "socket_raw_receive",
+    "socket_raw_send", "error", "app_command_completion", "command_error",
+}
+
+
+def _event_guild_id(args) -> int | None:
+    """イベントの引数から、どのサーバーのイベントかを調べる。"""
+    for a in args:
+        try:
+            if isinstance(a, discord.Guild):
+                return a.id
+            gid = getattr(a, "guild_id", None)
+            if isinstance(gid, int):
+                return gid
+            g = getattr(a, "guild", None)
+            if isinstance(g, discord.Guild):
+                return g.id
+        except Exception:
+            continue
+    return None
+
+
+def _event_actor_id(args) -> int | None:
+    for a in args:
+        for attr in ("user", "author"):
+            try:
+                u = getattr(a, attr, None)
+                if u is not None and isinstance(getattr(u, "id", None), int):
+                    return u.id
+            except Exception:
+                continue
+    return None
 
 
 class AuthBot(commands.Bot):
@@ -424,15 +714,6 @@ class AuthBot(commands.Bot):
         except Exception:
             return False
 
-    def kv_ready(self) -> bool:
-        return redis_client() is not None
-
-    async def kv(self, op: str, *args):
-        return await _redis_do(op, *args)
-
-    async def guild_log(self, guild: discord.Guild, embed: discord.Embed) -> bool:
-        return await send_guild_log(guild, embed)
-
     # --- 追加機能（cogs/）が使う窓口 ---
     def kv_ready(self) -> bool:
         return redis_client() is not None
@@ -444,6 +725,68 @@ class AuthBot(commands.Bot):
     async def guild_log(self, guild: discord.Guild, embed: discord.Embed) -> bool:
         """/set-log-channel で設定された、そのサーバーのログチャンネルへ送る。"""
         return await send_guild_log(guild, embed)
+
+    def store_load(self, name: str) -> dict:
+        """設定の読み込み（Upstash があればそこ、なければ <name>.json）。"""
+        return storage.load(name, Path(f"{name}.json"))
+
+    def store_save(self, name: str, data: dict) -> None:
+        storage.save(name, Path(f"{name}.json"), data)
+
+    def is_owner_id(self, user_id: int) -> bool:
+        return user_id in (self._owner_ids or set())
+
+    # ---------- ライセンス停止中は、バックグラウンド処理もすべて止める ----------
+    def dispatch(self, event_name: str, /, *args, **kwargs):
+        """すべてのイベント（自動モデレーション・イベントログ・Nuke検知・cogsのリスナー等）の入口。
+        停止中のサーバーのイベントは、Botのオーナーの操作を除いて、ここで捨てる。"""
+        try:
+            suspended = suspended_guild_ids()
+            if suspended and event_name not in LICENSE_EXEMPT_EVENTS:
+                gid = _event_guild_id(args)
+                if gid in suspended and _event_actor_id(args) not in (self._owner_ids or set()):
+                    if event_name == "interaction" and args:
+                        self._reply_suspended(args[0])
+                    return
+        except Exception:
+            pass  # 判定できないときは、通常どおり処理する
+        super().dispatch(event_name, *args, **kwargs)
+
+    def _reply_suspended(self, interaction) -> None:
+        """ボタン・セレクト・モーダル（cogs のもの含む）に、停止中であることを返す。
+        スラッシュコマンドは LicenseTree が返すので、ここでは扱わない。"""
+        if not isinstance(interaction, discord.Interaction):
+            return
+        if interaction.type not in (discord.InteractionType.component,
+                                    discord.InteractionType.modal_submit):
+            return
+
+        async def _send():
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(SUSPENDED_MESSAGE, ephemeral=True)
+            except discord.HTTPException:
+                pass
+        asyncio.create_task(_send())
+
+    def _install_view_gate(self) -> None:
+        """登録済みView（永続ボタン等）の処理も、停止中のサーバーでは実行しない。"""
+        store = getattr(self._connection, "_view_store", None)
+        if store is None:
+            return
+        for name in ("dispatch_view", "dispatch_modal"):
+            orig = getattr(store, name, None)
+            if orig is None:
+                continue
+
+            def gated(*a, __orig=orig, **kw):
+                inter = next((x for x in list(a) + list(kw.values())
+                              if isinstance(x, discord.Interaction)), None)
+                if (inter is not None and inter.guild_id and is_license_suspended(inter.guild_id)
+                        and inter.user.id not in (self._owner_ids or set())):
+                    return None  # 返信は dispatch("interaction") 側で行う
+                return __orig(*a, **kw)
+            setattr(store, name, gated)
 
     async def get_owner_ids(self) -> set[int]:
         """Botのオーナー（チーム所有の場合はチームのオーナー）のIDを返す。"""
@@ -517,6 +860,28 @@ class AuthBot(commands.Bot):
             await gban_auto_ban(member)
         except Exception as e:
             print(f"GBANの自動BAN処理エラー: {safe_error(e)}")
+        try:  # 大量参加（Raid）の検知
+            await raid_check_join(member)
+        except Exception as e:
+            print(f"Raid検知の処理エラー: {safe_error(e)}")
+
+    @tasks.loop(hours=24)
+    async def auto_backup(self):
+        """Nuke防衛が有効なサーバーは、1日1回自動でバックアップする（復元用）。"""
+        cfg = load_defense_config()
+        for g in list(self.guilds):
+            if not cfg.get(str(g.id), {}).get("nuke_defense") or is_license_suspended(g.id):
+                continue
+            try:
+                take_backup(g, auto=True)
+            except Exception as e:
+                print(f"自動バックアップに失敗 ({g.id}): {safe_error(e)}")
+            await asyncio.sleep(1)
+
+    @auto_backup.before_loop
+    async def _before_auto_backup(self):
+        await self.wait_until_ready()
+        await asyncio.sleep(60)
 
     @tasks.loop(minutes=10)
     async def refresh_status(self):
@@ -525,6 +890,11 @@ class AuthBot(commands.Bot):
 
     async def setup_hook(self):
         self.add_view(TicketControlView())  # 再起動後も、ボタンが動くようにする
+        self._install_view_gate()  # ライセンス停止中は、ボタン等の処理も止める
+        try:  # 停止中サーバーの判定で、オーナーを素早く判別できるようにする
+            await self.get_owner_ids()
+        except Exception as e:
+            print(f"オーナー情報の取得に失敗: {safe_error(e)}")
         for name in EXTRA_COGS:  # 追加機能（失敗しても、ほかの機能は動かす）
             if name in DISABLED_COGS:
                 continue
@@ -551,6 +921,8 @@ class AuthBot(commands.Bot):
         # ステータス更新ループを開始（再接続でon_readyが再度呼ばれても二重起動しない）
         if not self.refresh_status.is_running():
             self.refresh_status.start()
+        if not self.auto_backup.is_running():
+            self.auto_backup.start()
 
         # 起動時に1回だけ、不要な古いスラッシュコマンド（例: /veryfi-panel）を削除する
         if not PURGE_OLD_COMMANDS or getattr(self, "_purged", False):
@@ -581,92 +953,625 @@ class AuthBot(commands.Bot):
 bot = AuthBot()
 
 
-# ---------- セキュリティ・Nuke防衛・バックアップ ----------
-raid_action_history: dict[int, list[float]] = {}
+# ---------- セキュリティ・Nuke/Raid対策・バックアップ ----------
+# 1) 監査ログを監視し、短時間の大量削除・大量BAN等を「実行者ごと」に数える
+# 2) しきい値を超えたら、実行者（荒らし・乗っ取られたBOT等）を即座にBAN / キック / 権限剥奪
+# 3) 消されたチャンネル・ロールを復元し、巻き込まれてBANされた人のBANを解除
+# 4) サーバーの管理チャンネルとBotオーナーのDMへ緊急警告、ダッシュボードに履歴を残す
+_nuke_hits: dict[tuple[int, int, str], deque] = {}
+_nuke_active: dict[tuple[int, int], dict] = {}
+_deleted_channels: dict[int, dict[int, tuple[float, dict]]] = {}
+_deleted_roles: dict[int, dict[int, tuple[float, dict]]] = {}
+_join_log: dict[int, deque] = {}
+_raid_until: dict[int, float] = {}
+_raid_prev_level: dict[int, discord.VerificationLevel] = {}
+_dm_last: dict[str, float] = {}
+SNAPSHOT_TTL = 900  # 削除されたチャンネル・ロールの情報を覚えておく秒数
+
+NUKE_KIND_LABEL = {
+    "channel_delete": "チャンネルの大量削除", "channel_create": "チャンネルの大量作成",
+    "role_delete": "ロールの大量削除", "role_create": "ロールの大量作成",
+    "ban": "連続BAN", "kick": "連続キック", "webhook_create": "Webhookの大量作成",
+    "prune": "メンバーの一括削除（Prune）",
+}
+NUKE_ACTION_LABEL = {"ban": "BAN", "kick": "キック", "strip": "権限剥奪（ロールを全て外す）"}
+
+
+def _audit_kinds() -> dict:
+    A = discord.AuditLogAction
+    pairs = {"channel_delete": "channel_delete", "channel_create": "channel_create",
+             "role_delete": "role_delete", "role_create": "role_create", "ban": "ban",
+             "kick": "kick", "webhook_create": "webhook_create", "member_prune": "prune"}
+    return {getattr(A, k): v for k, v in pairs.items() if hasattr(A, k)}
+
+
+AUDIT_KINDS = _audit_kinds()
+
+
+def _ow_list(overwrites: dict) -> list[dict]:
+    out = []
+    for target, ow in overwrites.items():
+        allow, deny = ow.pair()
+        if isinstance(target, discord.Role):
+            out.append({"kind": "role", "id": target.id, "name": target.name,
+                        "everyone": target.is_default(), "allow": allow.value, "deny": deny.value})
+        else:
+            out.append({"kind": "member", "id": target.id, "allow": allow.value, "deny": deny.value})
+    return out
+
+
+def serialize_channel(ch: discord.abc.GuildChannel) -> dict:
+    d = {"id": ch.id, "name": ch.name, "type": str(ch.type), "position": ch.position,
+         "category_id": getattr(ch, "category_id", None),
+         "category": ch.category.name if getattr(ch, "category", None) else None,
+         "overwrites": _ow_list(ch.overwrites)}
+    for attr in ("topic", "nsfw", "slowmode_delay", "bitrate", "user_limit"):
+        v = getattr(ch, attr, None)
+        if v is not None:
+            d[attr] = v
+    return d
+
+
+def serialize_role(r: discord.Role) -> dict:
+    return {"id": r.id, "name": r.name, "color": r.color.value, "permissions": r.permissions.value,
+            "hoist": r.hoist, "mentionable": r.mentionable, "position": r.position}
+
+
+def take_backup(guild: discord.Guild, *, auto: bool = False) -> dict:
+    roles = [serialize_role(r) for r in sorted(guild.roles, key=lambda r: r.position)
+             if not r.is_default() and not r.managed]
+    channels = [serialize_channel(c) for c in sorted(guild.channels, key=lambda c: c.position)]
+    snap = {"v": 2, "time": datetime.now(JST).strftime("%Y-%m-%d %H:%M"), "auto": auto,
+            "roles": roles, "channels": channels}
+    backups = load_backups()
+    lst = backups.setdefault(str(guild.id), [])
+    lst.append(snap)
+    manual = [b for b in lst if not b.get("auto")][-10:]  # 手動は10件
+    autos = [b for b in lst if b.get("auto")][-3:]        # 自動は3件まで残す
+    backups[str(guild.id)] = sorted(manual + autos, key=lambda b: b.get("time", ""))
+    save_backups(backups)
+    return snap
+
+
+def _build_overwrites(guild: discord.Guild, items: list[dict], role_map: dict[int, discord.Role]):
+    out = {}
+    for o in items or []:
+        try:
+            pair = discord.PermissionOverwrite.from_pair(discord.Permissions(int(o["allow"])),
+                                                         discord.Permissions(int(o["deny"])))
+        except Exception:
+            continue
+        target = None
+        if o.get("kind") == "role":
+            if o.get("everyone"):
+                target = guild.default_role
+            else:
+                target = (guild.get_role(int(o["id"])) or role_map.get(int(o["id"]))
+                          or discord.utils.get(guild.roles, name=o.get("name")))
+        else:
+            target = guild.get_member(int(o["id"]))
+        if target is not None:
+            out[target] = pair
+    return out
+
+
+async def _create_channel(guild: discord.Guild, d: dict, category, role_map) -> discord.abc.GuildChannel:
+    ow = _build_overwrites(guild, d.get("overwrites"), role_map)
+    kind = d.get("type", "text")
+    name = d.get("name", "restored")
+    reason = "Nuke対策: バックアップから復元"
+    if kind == "category":
+        return await guild.create_category(name, overwrites=ow, reason=reason)
+    if kind in ("voice", "stage_voice"):
+        bitrate = min(int(d.get("bitrate") or 64000), int(guild.bitrate_limit))
+        if kind == "stage_voice" and hasattr(guild, "create_stage_channel"):
+            return await guild.create_stage_channel(name, category=category, overwrites=ow, reason=reason)
+        return await guild.create_voice_channel(name, category=category, overwrites=ow, bitrate=bitrate,
+                                                user_limit=int(d.get("user_limit") or 0), reason=reason)
+    kw = dict(category=category, overwrites=ow, reason=reason)
+    if d.get("topic"):
+        kw["topic"] = d["topic"][:1024]
+    if kind == "forum" and hasattr(guild, "create_forum"):
+        return await guild.create_forum(name, **kw)
+    if d.get("nsfw"):
+        kw["nsfw"] = True
+    if d.get("slowmode_delay"):
+        kw["slowmode_delay"] = int(d["slowmode_delay"])
+    if kind == "news" and "COMMUNITY" in guild.features:
+        kw["news"] = True
+    return await guild.create_text_channel(name, **kw)
+
+
+async def _create_role(guild: discord.Guild, d: dict) -> discord.Role:
+    perms = discord.Permissions(int(d.get("permissions", 0)))
+    perms.value &= guild.me.guild_permissions.value  # Bot自身が持たない権限は付けられない
+    return await guild.create_role(name=d.get("name", "restored"), permissions=perms,
+                                   colour=discord.Colour(int(d.get("color", 0))),
+                                   hoist=bool(d.get("hoist")), mentionable=bool(d.get("mentionable")),
+                                   reason="Nuke対策: バックアップから復元")
+
+
+async def restore_items(guild: discord.Guild, roles: list[dict], channels: list[dict],
+                        *, limit: int = 250) -> dict:
+    """ロール → カテゴリ → チャンネルの順に作成する。既存のものは変更・削除しない。"""
+    rep = {"roles": 0, "channels": 0, "failed": 0}
+    role_map: dict[int, discord.Role] = {}
+    made = 0
+    for d in sorted(roles, key=lambda x: x.get("position", 0)):
+        if made >= limit:
+            break
+        try:
+            r = await _create_role(guild, d)
+            if d.get("id"):
+                role_map[int(d["id"])] = r
+            rep["roles"] += 1
+            made += 1
+        except discord.HTTPException:
+            rep["failed"] += 1
+        await asyncio.sleep(0.4)
+    cat_map: dict[int, discord.CategoryChannel] = {}
+    cats = [c for c in channels if c.get("type") == "category"]
+    others = [c for c in channels if c.get("type") != "category"]
+    for d in cats + others:
+        if made >= limit:
+            break
+        category = None
+        if d.get("type") != "category":
+            cid = d.get("category_id")
+            category = (guild.get_channel(cid) if cid else None) or cat_map.get(cid or 0)
+            if category is None and d.get("category"):
+                category = discord.utils.get(guild.categories, name=d["category"])
+        try:
+            ch = await _create_channel(guild, d, category, role_map)
+            if d.get("type") == "category" and d.get("id"):
+                cat_map[int(d["id"])] = ch
+            rep["channels"] += 1
+            made += 1
+            if d.get("position") is not None:
+                try:
+                    await ch.edit(position=int(d["position"]))
+                except discord.HTTPException:
+                    pass
+        except discord.HTTPException:
+            rep["failed"] += 1
+        await asyncio.sleep(0.4)
+    return rep
+
+
+async def restore_backup(guild: discord.Guild, b: dict) -> dict:
+    """バックアップにあって、今のサーバーに無いものだけを作り直す（旧形式のバックアップにも対応）。"""
+    role_names = {r.name for r in guild.roles}
+    roles = [r for r in b.get("roles", []) if r.get("name") not in role_names]
+    existing = {(c.name, str(c.type), c.category.name if c.category else None) for c in guild.channels}
+    chans = []
+    for c in b.get("channels", []):
+        key = (c.get("name"), c.get("type", "text"),
+               c.get("category") if c.get("type") != "category" else None)
+        if key not in existing:
+            c = dict(c)
+            c.pop("category_id", None)  # 旧IDは使わず、カテゴリ名で探す
+            chans.append(c)
+    return await restore_items(guild, roles, chans)
+
+
+async def send_admin_alert(guild: discord.Guild, embed: discord.Embed) -> bool:
+    """サーバーの管理チャンネルへ警告する（/set-log-channel → /setup のログ → システムチャンネルの順）。"""
+    if await send_guild_log(guild, embed):
+        return True
+    gcfg = load_config().get(str(guild.id)) or {}
+    for ch in (guild.get_channel(int(gcfg.get("log_channel_id") or 0)), guild.system_channel,
+               guild.public_updates_channel):
+        if _can_send(ch, guild):
+            try:
+                await ch.send(embed=embed)
+                return True
+            except discord.HTTPException:
+                continue
+    return False
+
+
+async def dm_owners(embed: discord.Embed, *, dedupe: str | None = None, cooldown: float = 30) -> None:
+    """Botのオーナーへ、DMで緊急警告を送る。"""
+    now = time.time()
+    if dedupe:
+        if now - _dm_last.get(dedupe, 0) < cooldown:
+            return
+        _dm_last[dedupe] = now
+    try:
+        owner_ids = await bot.get_owner_ids()
+    except Exception:
+        return
+    for oid in owner_ids:
+        try:
+            user = bot.get_user(oid) or await bot.fetch_user(oid)
+            await user.send(embed=embed)
+        except Exception as e:
+            print(f"オーナーへのDM送信に失敗: {safe_error(e)}")
+
+
+async def _punish(guild: discord.Guild, uid: int, action: str, reason: str) -> str:
+    """実行者を止める。戻り値は結果の説明。"""
+    if uid == guild.owner_id:
+        return "⚠️ サーバー所有者のため、Botからは処罰できません（所有者アカウントの乗っ取りの可能性）"
+    member = guild.get_member(uid)
+    if member is None:
+        try:
+            member = await guild.fetch_member(uid)
+        except discord.HTTPException:
+            member = None
+    if member is not None and member.top_role >= guild.me.top_role:
+        return "⚠️ 実行者のロールがBotより上のため、処罰できません（Botのロールを一番上に移動してください）"
+    if action == "strip" and member is not None and member.bot:
+        action = "kick"  # BOTの連携ロールは外せないので、キックにする
+    try:
+        if action == "ban":
+            await guild.ban(discord.Object(id=uid), reason=reason[:500], delete_message_seconds=0)
+            return "✅ BANしました"
+        if action == "kick" and member is not None:
+            await member.kick(reason=reason[:500])
+            return "✅ キックしました"
+        if member is not None:
+            keep = [r for r in member.roles if r.managed or r.is_default()]
+            await member.edit(roles=keep, reason=reason[:500])
+            return "✅ ロールをすべて外しました（権限剥奪）"
+        return "⚠️ 実行者がサーバーに見つかりません"
+    except discord.HTTPException as e:
+        if member is not None and action != "strip":  # BAN・キックに失敗したら、せめて権限を外す
+            try:
+                await member.edit(roles=[r for r in member.roles if r.managed or r.is_default()],
+                                  reason=reason[:500])
+                return f"⚠️ {NUKE_ACTION_LABEL.get(action, action)}に失敗したため、ロールを外しました"
+            except discord.HTTPException:
+                pass
+        return f"❌ 処罰に失敗しました（{safe_error(e)}・権限不足の可能性）"
+
+
+def _incident_embed(guild: discord.Guild, title: str, color: int, fields: list[tuple[str, str]]) -> discord.Embed:
+    e = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
+    e.add_field(name="🏠 サーバー", value=f"{guild.name}（`{guild.id}`）", inline=False)
+    for n, v in fields:
+        e.add_field(name=n, value=(v or "-")[:1024], inline=False)
+    return e
+
+
+async def handle_nuke(guild: discord.Guild, uid: int, kind: str, hits: list[tuple[float, int]]):
+    key = (guild.id, uid)
+    active = _nuke_active.get(key)
+    if active and time.time() - active["t"] < 120:
+        active["targets"].setdefault(kind, set()).update(t for _, t in hits)
+        return  # 対応中（重ねて処罰・通知しない）
+    active = {"t": time.time(), "targets": {kind: {t for _, t in hits}}}
+    _nuke_active[key] = active
+
+    d = get_defense(guild.id)
+    action = d.get("action", "ban")
+    actor = guild.get_member(uid) or bot.get_user(uid)
+    actor_text = f"<@{uid}>（`{uid}`）" + (f" {actor}" if actor else "")
+    is_bot = bool(getattr(actor, "bot", False))
+    result = await _punish(guild, uid, action, f"Nuke対策: {NUKE_KIND_LABEL.get(kind, kind)}を検知")
+
+    fields = [("🧨 検知内容", f"{NUKE_KIND_LABEL.get(kind, kind)}（{len(hits)}回 / {NUKE_WINDOW}秒）"),
+              ("👤 実行者", actor_text + ("（BOT・乗っ取りの可能性）" if is_bot else "")),
+              ("🔨 自動対処", f"{NUKE_ACTION_LABEL.get(action, action)} → {result}"),
+              ("♻️ 自動復元", "数秒後に実行します" if d.get("auto_restore", True) else "無効（/nuke-defense で有効化）")]
+    embed = _incident_embed(guild, "🚨 Nuke（サーバー破壊）を検知しました", 0xEF4444, fields)
+    await send_admin_alert(guild, embed)
+    await dm_owners(embed, dedupe=f"nuke:{guild.id}")
+    fire_and_forget(send_security_alert("Nuke検知", f"{guild.name}: {NUKE_KIND_LABEL.get(kind, kind)} / {result}",
+                                        None, level="critical", dedupe_key=f"nuke:{guild.id}"))
+    record_incident({"type": "nuke", "guild": guild.id, "guild_name": guild.name, "actor": uid,
+                     "actor_name": str(actor or uid), "actor_bot": is_bot, "kind": kind,
+                     "count": len(hits), "action": action, "result": result})
+    if d.get("auto_restore", True):
+        await asyncio.sleep(5)  # 削除イベントが出揃うのを待つ
+        await auto_restore(guild, uid, active["targets"])
+
+
+async def auto_restore(guild: discord.Guild, uid: int, targets: dict[str, set[int]]):
+    now = time.time()
+    chans = [snap for cid, (t, snap) in _deleted_channels.get(guild.id, {}).items()
+             if cid in targets.get("channel_delete", set()) and now - t < SNAPSHOT_TTL]
+    roles = [snap for rid, (t, snap) in _deleted_roles.get(guild.id, {}).items()
+             if rid in targets.get("role_delete", set()) and now - t < SNAPSHOT_TTL]
+    rep = await restore_items(guild, roles, chans) if (chans or roles) else {"roles": 0, "channels": 0, "failed": 0}
+    for cid in targets.get("channel_delete", set()):
+        _deleted_channels.get(guild.id, {}).pop(cid, None)
+    for rid in targets.get("role_delete", set()):
+        _deleted_roles.get(guild.id, {}).pop(rid, None)
+    unbanned = 0
+    for vid in targets.get("ban", set()):  # 荒らしにBANされた人のBANを解除
+        if vid == uid:
+            continue
+        try:
+            await guild.unban(discord.Object(id=vid), reason="Nuke対策: 荒らしによるBANを取り消し")
+            unbanned += 1
+        except discord.HTTPException:
+            pass
+        await asyncio.sleep(0.4)
+    if not (rep["roles"] or rep["channels"] or rep["failed"] or unbanned):
+        return
+    text = (f"ロール {rep['roles']} 件・チャンネル {rep['channels']} 件を復元、BAN解除 {unbanned} 件"
+            + (f"（失敗 {rep['failed']} 件）" if rep["failed"] else ""))
+    embed = _incident_embed(guild, "♻️ Nukeの被害を自動復元しました", 0x22C55E, [("結果", text)])
+    embed.set_footer(text="チャンネル内のメッセージは復元できません。/backup restore で全体の復元もできます")
+    await send_admin_alert(guild, embed)
+    record_incident({"type": "restore", "guild": guild.id, "guild_name": guild.name,
+                     "actor": uid, "result": text})
+
+
+@bot.event
+async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
+    """監査ログから実行者を特定する（Botに「監査ログを表示」権限が必要）。"""
+    guild = entry.guild
+    kind = AUDIT_KINDS.get(entry.action)
+    if kind is None or not get_defense(guild.id).get("nuke_defense", False):
+        return
+    uid = getattr(entry, "user_id", None) or (entry.user.id if entry.user else None)
+    if uid is None or (bot.user and uid == bot.user.id):
+        return  # Bot自身（復元作業など）は数えない
+    d = get_defense(guild.id)
+    if uid in {int(x) for x in d.get("whitelist", [])} or bot.is_owner_id(uid):
+        return
+    if kind == "prune":
+        removed = int(getattr(entry.extra, "members_removed", 0) or 0)
+        if removed < 10:
+            return
+    target_id = int(getattr(entry.target, "id", 0) or 0)
+    now = time.time()
+    dq = _nuke_hits.setdefault((guild.id, uid, kind), deque(maxlen=100))
+    dq.append((now, target_id))
+    while dq and now - dq[0][0] > NUKE_WINDOW:
+        dq.popleft()
+    active = _nuke_active.get((guild.id, uid))
+    if active and now - active["t"] < 120:  # 対応中の追加被害も、復元の対象にする
+        active["targets"].setdefault(kind, set()).add(target_id)
+        return
+    if len(dq) >= NUKE_LIMITS.get(kind, 3):
+        hits = list(dq)
+        dq.clear()
+        await handle_nuke(guild, uid, kind, hits)
 
 
 @bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    """削除されたチャンネルの情報を覚えておく（自動復元用）。"""
     guild = channel.guild
-    if not get_defense(guild.id).get("nuke_defense", False) or is_license_suspended(guild.id):
+    if not get_defense(guild.id).get("nuke_defense", False):
         return
-    now = time.time()
-    recent = [t for t in raid_action_history.setdefault(guild.id, []) if now - t < 10] + [now]
-    raid_action_history[guild.id] = recent
-    if len(recent) >= 3:
-        embed = discord.Embed(
-            title="🚨 Nuke（破壊的行為）を検知しました！",
-            description="短時間に複数のチャンネルが削除されたため、自動防衛システムが作動しました。",
-            color=0xEF4444)
-        await send_guild_log(guild, embed)
+    store = _deleted_channels.setdefault(guild.id, {})
+    store[channel.id] = (time.time(), serialize_channel(channel))
+    if len(store) > 300:
+        for k in sorted(store, key=lambda k: store[k][0])[:len(store) - 300]:
+            store.pop(k, None)
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role):
+    guild = role.guild
+    if role.managed or not get_defense(guild.id).get("nuke_defense", False):
+        return
+    store = _deleted_roles.setdefault(guild.id, {})
+    store[role.id] = (time.time(), serialize_role(role))
+    if len(store) > 300:
+        for k in sorted(store, key=lambda k: store[k][0])[:len(store) - 300]:
+            store.pop(k, None)
 
 
 @bot.event
 async def on_guild_role_create(role: discord.Role):
     guild = role.guild
-    if is_license_suspended(guild.id):
+    if not get_defense(guild.id).get("nuke_defense", False):
         return
     if role.permissions.administrator or role.permissions.manage_guild:
         embed = discord.Embed(
             title="⚠️ 危険な高権限ロールの作成を検知",
             description=f"管理者権限を持つロール `{role.name}` が作成されました。", color=0xF59E0B)
-        await send_guild_log(guild, embed)
+        await send_admin_alert(guild, embed)
+        record_incident({"type": "warning", "guild": guild.id, "guild_name": guild.name,
+                         "kind": "danger_role", "result": f"高権限ロール「{role.name}」が作成された"})
 
 
-@bot.tree.command(name="nuke-defense", description="Nuke（サーバー破壊）自動検知や招待リンクブロックを設定します")
-@app_commands.describe(nuke_defense="Nuke自動検知を有効にするか", invite_block="招待リンクの自動ブロックを有効にするか")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-async def nuke_defense_cmd(interaction: discord.Interaction, nuke_defense: bool, invite_block: bool):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
+async def raid_check_join(member: discord.Member):
+    """短時間の大量参加（Raid）を検知し、Raidモード中の参加者を自動でキックする。
+    ※ SERVER MEMBERS INTENT（ENABLE_MEMBERS_INTENT=1）が必要。"""
+    guild = member.guild
+    if member.bot or not get_defense(guild.id).get("raid_protection", False):
         return
-    cfg = load_defense_config()
-    cfg[str(interaction.guild.id)] = {"nuke_defense": nuke_defense, "invite_block": invite_block}
-    save_defense_config(cfg)
-    await interaction.response.send_message(
-        f"✅ セキュリティ設定を更新しました\n・Nuke自動検知: `{'有効' if nuke_defense else '無効'}`\n"
-        f"・自動招待リンクブロック: `{'有効' if invite_block else '無効'}`", ephemeral=True)
+    now = time.time()
+    if _raid_until.get(guild.id, 0) > now:
+        try:
+            await member.kick(reason="Raid対策: Raidモード中の参加")
+        except discord.HTTPException:
+            pass
+        return
+    dq = _join_log.setdefault(guild.id, deque(maxlen=200))
+    dq.append((now, member.id))
+    while dq and now - dq[0][0] > RAID_JOIN_WINDOW:
+        dq.popleft()
+    if len(dq) < RAID_JOIN_THRESHOLD:
+        return
+    _raid_until[guild.id] = now + RAID_LOCK_MINUTES * 60
+    burst = [uid for _, uid in dq]
+    dq.clear()
+    level_note = "変更なし（「サーバー管理」権限がありません）"
+    try:
+        if guild.verification_level < discord.VerificationLevel.high:
+            _raid_prev_level[guild.id] = guild.verification_level
+            await guild.edit(verification_level=discord.VerificationLevel.high, reason="Raid対策")
+            level_note = "認証レベルを「高」に引き上げました"
+        else:
+            level_note = "すでに高い認証レベルです"
+    except discord.HTTPException:
+        pass
+    kicked = 0
+    for uid in burst:
+        try:
+            await guild.kick(discord.Object(id=uid), reason="Raid対策: 大量参加の一員")
+            kicked += 1
+        except discord.HTTPException:
+            pass
+        await asyncio.sleep(0.3)
+    embed = _incident_embed(guild, "🚨 Raid（大量参加）を検知しました", 0xEF4444, [
+        ("📈 検知内容", f"{RAID_JOIN_WINDOW}秒間に {len(burst)} 人が参加"),
+        ("🔨 自動対処", f"参加者 {kicked} 人をキック / {level_note}"),
+        ("⏱️ Raidモード", f"{RAID_LOCK_MINUTES}分間、新しい参加者を自動でキックします")])
+    await send_admin_alert(guild, embed)
+    await dm_owners(embed, dedupe=f"raid:{guild.id}")
+    record_incident({"type": "raid", "guild": guild.id, "guild_name": guild.name,
+                     "count": len(burst), "result": f"{kicked}人キック / {level_note}"})
+    fire_and_forget(_end_raid_mode(guild))
 
 
-@bot.tree.command(name="backup", description="現在のサーバーのロール構造やチャンネル構成をバックアップします")
-@app_commands.describe(action="操作を選択")
-@app_commands.choices(action=[
-    app_commands.Choice(name="バックアップ作成 (create)", value="create"),
-    app_commands.Choice(name="バックアップ一覧 (list)", value="list")])
+async def _end_raid_mode(guild: discord.Guild):
+    await asyncio.sleep(RAID_LOCK_MINUTES * 60)
+    if _raid_until.get(guild.id, 0) > time.time():
+        return
+    prev = _raid_prev_level.pop(guild.id, None)
+    if prev is not None:
+        try:
+            await guild.edit(verification_level=prev, reason="Raid対策の終了")
+        except discord.HTTPException:
+            pass
+    await send_admin_alert(guild, discord.Embed(
+        title="✅ Raidモードを解除しました", color=0x22C55E,
+        description="新しい参加者の自動キックを終了し、認証レベルを元に戻しました。"))
+
+
+@bot.tree.command(name="nuke-defense", description="Nuke/Raid対策（自動検知・自動処罰・自動復元）と招待リンクブロックを設定します")
+@app_commands.describe(nuke_defense="Nuke（大量削除・大量BAN等）の自動検知を有効にするか",
+                       invite_block="招待リンクの自動ブロックを有効にするか",
+                       action="Nukeの実行者への自動対処（省略時は今の設定 / 初期値はBAN）",
+                       raid_protection="大量参加（Raid）の自動検知を有効にするか（メンバーIntentが必要）",
+                       auto_restore="消されたチャンネル・ロールを自動で復元するか")
+@app_commands.choices(action=[app_commands.Choice(name="BAN", value="ban"),
+                              app_commands.Choice(name="キック", value="kick"),
+                              app_commands.Choice(name="権限剥奪（ロールを全て外す）", value="strip")])
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-async def backup_cmd(interaction: discord.Interaction, action: str):
+async def nuke_defense_cmd(interaction: discord.Interaction, nuke_defense: bool, invite_block: bool,
+                           action: str | None = None, raid_protection: bool | None = None,
+                           auto_restore: bool | None = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
         return
     guild = interaction.guild
-    backups = load_backups()
-    gid = str(guild.id)
+    cfg = load_defense_config()
+    cur = cfg.get(str(guild.id), {})
+    cur.update({"nuke_defense": nuke_defense, "invite_block": invite_block})
+    if action is not None:
+        cur["action"] = action
+    if raid_protection is not None:
+        cur["raid_protection"] = raid_protection
+    if auto_restore is not None:
+        cur["auto_restore"] = auto_restore
+    cfg[str(guild.id)] = cur
+    save_defense_config(cfg)
+    if nuke_defense:
+        try:
+            take_backup(guild, auto=True)  # 有効化した時点の状態を、復元用に保存しておく
+        except Exception as e:
+            print(f"バックアップに失敗: {safe_error(e)}")
+    p = guild.me.guild_permissions
+    missing = [n for n, ok in (("監査ログを表示", p.view_audit_log), ("メンバーをBAN", p.ban_members),
+                               ("メンバーをキック", p.kick_members), ("ロールの管理", p.manage_roles),
+                               ("チャンネルの管理", p.manage_channels)) if not ok]
+    on = lambda v: "有効" if v else "無効"  # noqa: E731
+    msg = (f"✅ セキュリティ設定を更新しました\n"
+           f"・Nuke自動検知: `{on(nuke_defense)}`（対処: `{NUKE_ACTION_LABEL.get(cur.get('action', 'ban'))}`）\n"
+           f"・自動復元: `{on(cur.get('auto_restore', True))}`\n"
+           f"・Raid自動検知: `{on(cur.get('raid_protection', False))}`"
+           + ("" if ENABLE_MEMBERS_INTENT else "（※Bot側でメンバーIntentが無効のため動作しません）") + "\n"
+           f"・自動招待リンクブロック: `{on(invite_block)}`\n"
+           f"・信頼済み（除外）ユーザー: {len(cur.get('whitelist', []))} 人（`/nuke-whitelist`）")
+    if missing:
+        msg += "\n\n⚠️ Botに次の権限がありません: " + "、".join(missing)
+    msg += "\n💡 Botのロールは、できるだけ一番上に置いてください（上位のロールを持つ荒らしは処罰できません）。"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="nuke-whitelist", description="Nuke検知の対象外にする信頼済みユーザー・BOTを管理します")
+@app_commands.describe(action="追加 / 削除 / 一覧", user="対象のユーザー・BOT")
+@app_commands.choices(action=[app_commands.Choice(name="追加 (add)", value="add"),
+                              app_commands.Choice(name="削除 (remove)", value="remove"),
+                              app_commands.Choice(name="一覧 (list)", value="list")])
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def nuke_whitelist_cmd(interaction: discord.Interaction, action: str, user: discord.User | None = None):
+    if interaction.user.id != interaction.guild.owner_id and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
+        return
+    cfg = load_defense_config()
+    cur = cfg.setdefault(str(interaction.guild.id), {})
+    wl = [int(x) for x in cur.get("whitelist", [])]
+    if action == "list":
+        text = "\n".join(f"・<@{u}>（`{u}`）" for u in wl) or "登録なし"
+        await interaction.response.send_message(f"🛡️ 信頼済みユーザー（{len(wl)}人）\n{text}"[:1900],
+                                                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        return
+    if user is None:
+        await interaction.response.send_message("`user` を指定してください。", ephemeral=True)
+        return
+    if action == "add" and user.id not in wl:
+        wl.append(user.id)
+    elif action == "remove" and user.id in wl:
+        wl.remove(user.id)
+    cur["whitelist"] = wl
+    save_defense_config(cfg)
+    await interaction.response.send_message(
+        f"✅ {user.mention} を信頼済みユーザーから{'追加' if action == 'add' else '削除'}しました。",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="backup", description="サーバーのロール・チャンネル構成のバックアップを作成・一覧・復元します")
+@app_commands.describe(action="操作を選択", number="復元するバックアップの番号（一覧の番号。省略で最新）")
+@app_commands.choices(action=[
+    app_commands.Choice(name="バックアップ作成 (create)", value="create"),
+    app_commands.Choice(name="バックアップ一覧 (list)", value="list"),
+    app_commands.Choice(name="バックアップから復元 (restore)", value="restore")])
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def backup_cmd(interaction: discord.Interaction, action: str,
+                     number: app_commands.Range[int, 1, 20] | None = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
+        return
+    guild = interaction.guild
+    server_backups = load_backups().get(str(guild.id), [])
     if action == "create":
-        role_data = [{"name": r.name, "color": r.color.value, "permissions": r.permissions.value}
-                     for r in guild.roles if not r.is_default()]
-        channel_data = [{"name": c.name, "type": str(c.type)} for c in guild.channels]
-        server_backups = backups.setdefault(gid, [])
-        server_backups.append({"time": datetime.now(JST).strftime("%Y-%m-%d %H:%M"),
-                               "roles": role_data, "channels": channel_data})
-        del server_backups[:-10]  # 古いものは、最新10件を残して削除
-        save_backups(backups)
-        await interaction.response.send_message("✅ 現在のロールとチャンネルの構成をバックアップしました。", ephemeral=True)
-    else:
-        server_backups = backups.get(gid, [])
-        if not server_backups:
-            await interaction.response.send_message("保存されたバックアップはありません。", ephemeral=True)
-            return
-        desc = "\n".join(f"・{b['time']} (ロール: {len(b['roles'])}件, チャンネル: {len(b['channels'])}件)"
-                         for b in server_backups)
+        b = take_backup(guild)
         await interaction.response.send_message(
-            embed=discord.Embed(title="💾 サーバーバックアップ一覧", description=desc, color=0x3B82F6),
+            f"✅ バックアップしました（ロール {len(b['roles'])} 件・チャンネル {len(b['channels'])} 件）。",
             ephemeral=True)
+        return
+    if not server_backups:
+        await interaction.response.send_message("保存されたバックアップはありません。", ephemeral=True)
+        return
+    newest_first = list(reversed(server_backups))
+    if action == "list":
+        desc = "\n".join(
+            f"`{i}`. {b['time']}{'（自動）' if b.get('auto') else ''} — ロール {len(b.get('roles', []))} 件 / "
+            f"チャンネル {len(b.get('channels', []))} 件" for i, b in enumerate(newest_first, 1))
+        await interaction.response.send_message(
+            embed=discord.Embed(title="💾 サーバーバックアップ一覧", description=desc, color=0x3B82F6)
+            .set_footer(text="復元: /backup action:restore number:番号（足りないものだけを作り直します）"),
+            ephemeral=True)
+        return
+    idx = (number or 1) - 1
+    if idx >= len(newest_first):
+        await interaction.response.send_message("その番号のバックアップはありません。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    rep = await restore_backup(guild, newest_first[idx])
+    await interaction.followup.send(
+        f"♻️ {newest_first[idx]['time']} のバックアップから復元しました\n"
+        f"・作成したロール: {rep['roles']} 件\n・作成したチャンネル: {rep['channels']} 件"
+        + (f"\n・失敗: {rep['failed']} 件（権限不足など）" if rep["failed"] else "")
+        + "\n※ 既存のロール・チャンネルは変更しません。メッセージは復元できません。", ephemeral=True)
+
 
 
 # ---------- 稼働状況の表示（Cog） ----------
-STATUS_TITLE = "📡 認証Bot 稼働状況"
+STATUS_TITLE = "📡 霊夢BOT 稼働状況"
 
 
 class StatusCog(commands.Cog):
@@ -874,6 +1779,56 @@ async def gban_set(uid: int, reason: str, by: int) -> None:
 
 async def gban_del(uid: int) -> bool:
     return bool(await _redis_do("delete", f"gban:{uid}"))
+
+
+async def gban_list(limit: int = 2000) -> list[tuple[int, dict]]:
+    """GBAN登録の一覧（ダッシュボード用）。"""
+    r = redis_client()
+    if r is None:
+        raise RuntimeError("redis-not-configured")
+    keys: list[str] = []
+    cursor = 0
+    while True:
+        cursor, batch = await r.scan(cursor, match="gban:*", count=500)
+        keys.extend(batch)
+        if not cursor or len(keys) >= limit:
+            break
+    out = []
+    for i in range(0, len(keys), 100):
+        chunk = keys[i:i + 100]
+        vals = await r.mget(chunk)
+        for k, v in zip(chunk, vals):
+            try:
+                d = json.loads(v) if v else {}
+            except Exception:
+                d = {"reason": str(v)}
+            try:
+                out.append((int(k.split(":", 1)[1]), d if isinstance(d, dict) else {"reason": str(d)}))
+            except ValueError:
+                continue
+    return sorted(out, key=lambda x: str(x[1].get("at", "")), reverse=True)
+
+
+async def gban_add_all(uid: int, reason: str, by: int) -> None:
+    """GBAN登録して、全サーバーでBANする（ダッシュボードから使う。BANはバックグラウンド）。"""
+    await gban_set(uid, reason, by)
+
+    async def _run():
+        ok = 0
+        for guild in list(bot.guilds):
+            if is_license_suspended(guild.id):
+                continue
+            try:
+                await guild.ban(discord.Object(id=uid), reason=f"Global BAN: {reason}"[:500])
+                ok += 1
+                await send_guild_log(guild, gban_log_embed(uid, reason, auto=False))
+            except discord.Forbidden:
+                await send_guild_log(guild, gban_log_embed(uid, reason, auto=False, ok=False))
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        print(f"GBAN（ダッシュボード）: {uid} を {ok} サーバーでBANしました")
+    fire_and_forget(_run())
 
 
 async def get_log_channel_id(guild_id: int) -> int | None:
@@ -1160,7 +2115,8 @@ async def panel_cmd(interaction: discord.Interaction,
                      f"{role_text} が自動で付与されます。"),
         color=0x5865F2,
     )
-    embed.set_footer(text="取得する情報はユーザーIDとアカウント名のみです")
+    embed.set_footer(text="認証時に、ユーザーID・アカウント名とIPアドレス（不正防止のため）を取得します"
+                          "｜詳しくは /privacy をご覧ください")
 
     view = discord.ui.View()
     view.add_item(discord.ui.Button(
@@ -1481,6 +2437,68 @@ async def server_blacklist_cmd(interaction: discord.Interaction, action: str,
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@bot.tree.command(name="subaccount",
+                  description="同じIPからの別アカウント（サブアカウント）を検知したときの動作を設定します")
+@app_commands.describe(action="検知したときの動作")
+@app_commands.choices(action=[
+    app_commands.Choice(name="認証を拒否する (block)", value="block"),
+    app_commands.Choice(name="認証は通し、ログに「該当」と記録するだけ (log)", value="log"),
+    app_commands.Choice(name="現在の設定を確認 (status)", value="status")])
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def subaccount_cmd(interaction: discord.Interaction, action: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
+        return
+    gid = str(interaction.guild.id)
+    if action != "status":
+        data = storage.load("subaccount_config", SUBACCOUNT_CONFIG_FILE)
+        data[gid] = action
+        storage.save("subaccount_config", SUBACCOUNT_CONFIG_FILE, data)
+    cur = get_subaccount_action(interaction.guild.id)
+    await interaction.response.send_message(
+        f"🛡️ サブアカウント検知時の動作: **{'認証を拒否' if cur == 'block' else 'ログに記録のみ'}**\n"
+        "・判定方法: このサーバーで認証済みの別アカウントと、同じIPアドレス（IPv6は回線単位）からの認証\n"
+        "・Global BAN・ブラックリスト・このサーバーでBAN済みのアカウントと同じIPからの認証は、"
+        "設定にかかわらず常に拒否します（BAN回避対策）\n"
+        f"・IPの記録は{IP_RETENTION_DAYS}日で自動削除されます\n"
+        "※ 家族・学校・携帯回線などでIPを共有している場合も「該当」になることがあります。",
+        ephemeral=True)
+
+
+@bot.tree.command(name="transcript-channel",
+                  description="チケットのトランスクリプト（会話ログ）を送るチャンネルを設定します（省略で解除）")
+@app_commands.describe(channel="トランスクリプトを送信するチャンネル（省略すると解除）")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def transcript_channel_cmd(interaction: discord.Interaction,
+                                 channel: discord.TextChannel | None = None):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("「サーバーの管理」権限が必要です。", ephemeral=True)
+        return
+    data = storage.load("ticket_config", TICKET_CONFIG_FILE)
+    gid = str(interaction.guild.id)
+    if channel is None:
+        data.get(gid, {}).pop("transcript_channel", None)
+        storage.save("ticket_config", TICKET_CONFIG_FILE, data)
+        await interaction.response.send_message(
+            "🔕 送信先を解除しました。トランスクリプトは、ボタンを押した人にだけ送られます。", ephemeral=True)
+        return
+    p = channel.permissions_for(interaction.guild.me)
+    if not (p.view_channel and p.send_messages and p.embed_links and p.attach_files):
+        await interaction.response.send_message(
+            f"{channel.mention} でBotに「チャンネルを見る・メッセージを送信・埋め込みリンク・ファイルを添付」の"
+            "権限がありません。", ephemeral=True)
+        return
+    data.setdefault(gid, {})["transcript_channel"] = channel.id
+    storage.save("ticket_config", TICKET_CONFIG_FILE, data)
+    await interaction.response.send_message(
+        f"✅ チケットのトランスクリプト（HTML＋テキスト）は {channel.mention} に送られます。\n"
+        "・チケット内の「📝 トランスクリプト保存」ボタンで送信\n"
+        "・「🗑️ チケット削除」時にも、削除前に自動で保存します\n"
+        "※ 閲覧できる人は、このチャンネルの権限で管理してください。", ephemeral=True)
+
+
 @bot.tree.command(name="license",
                   description="（オーナー専用）サーバーの利用ライセンスを管理します")
 @app_commands.describe(action="操作を選択",
@@ -1539,8 +2557,10 @@ async def license_cmd(interaction: discord.Interaction, action: str,
         data[gid] = {"at": datetime.now(JST).strftime("%Y-%m-%d %H:%M")}
         save_license(data)
         msg = (f"⏸️ {label} のライセンスを停止しました。\n"
-               "認証ページ（`/?guild=…`・`/login`・`/callback`）と、このサーバーのすべてのコマンド・ボタンが、"
-               "すぐに使えなくなります。Botはサーバーに残ります。")
+               "認証ページ（`/?guild=…`・`/login`・`/callback`）、このサーバーのすべてのコマンド・ボタン・"
+               "セレクトメニューに加え、自動モデレーション・イベントログ・Nuke検知・天気/災害の自動送信などの"
+               "バックグラウンド処理も、すぐにすべて停止します。Botはサーバーに残ります。\n"
+               "（Botオーナーの操作と `/license active` での再開は可能です）")
     else:  # active
         if gid not in data:
             await interaction.response.send_message(
@@ -1660,8 +2680,9 @@ app = FastAPI(lifespan=lifespan,
 
 # ---------- セキュリティ（レート制限・不正アクセスの通知） ----------
 def client_ip(request: Request) -> str:
-    """レート制限に使うIP。プロキシ（Render・Cloudflare等）の後ろでは、ヘッダーから本当のIPを取る。
-    ※IPはメモリ上のカウントにだけ使い、保存しない。通知にも生のIPは載せない。"""
+    """接続元のIP。プロキシ（Render・Cloudflare等）の後ろでは、ヘッダーから本当のIPを取る。
+    レート制限のほか、認証時はサブアカウント検知のため鍵付きハッシュ（と伏せ字）にして記録する。
+    セキュリティ通知には生のIPは載せない。"""
     if TRUST_PROXY_HEADERS:
         cf = request.headers.get("cf-connecting-ip")  # Cloudflareが付ける（偽装されにくい）
         if cf:
@@ -1802,11 +2823,59 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 
 
 # ---------- 認証ログ ----------
-async def send_auth_log(channel_id: int, user: dict, role: discord.Role | None,
-                        age: timedelta, passed: bool, blacklisted: bool = False):
-    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+async def check_ip_links(h: str | None, uid: int, guild_id: int) -> dict:
+    """同じIPのアカウントを調べ、サブアカウント判定とGBAN/ブラックリスト連携の結果を返す。"""
+    res = {"status": "unknown", "linked": [], "flags": [], "block": False}
+    if h is None:
+        return res  # IPを判定に使えない（プロキシ設定・社内ネットワーク等）
+    linked = ip_linked_users(h, uid)
+    same_guild = sorted(u for u, gs in linked.items() if guild_id in gs)
+    res["linked"] = same_guild
+    res["status"] = "hit" if same_guild else "clear"
+    bl = load_blacklist()["users"]
+    sbl = load_server_blacklist().get(str(guild_id), [])
+    guild = bot.get_guild(guild_id)
+    for other in list(linked)[:15]:
+        if await gban_get(other) is not None:
+            res["flags"].append(("gban", other))
+        elif other in bl:
+            res["flags"].append(("blacklist", other))
+        elif other in sbl:
+            res["flags"].append(("server_blacklist", other))
+        elif guild is not None and other in same_guild:
+            try:
+                await guild.fetch_ban(discord.Object(id=other))
+                res["flags"].append(("banned", other))
+            except discord.HTTPException:
+                pass
+    if res["flags"]:
+        res["block"] = True  # BAN・ブラックリスト対象と同一IP → BAN回避とみなす
+    elif res["status"] == "hit" and get_subaccount_action(guild_id) == "block":
+        res["block"] = True
+    return res
 
+
+FLAG_LABEL = {"gban": "Global BAN対象", "blacklist": "ブラックリスト登録者",
+              "server_blacklist": "このサーバーのブラックリスト登録者", "banned": "このサーバーでBAN済み"}
+
+
+async def send_auth_log(channel_id: int, user: dict, role: discord.Role | None,
+                        age: timedelta, passed: bool, blacklisted: bool = False,
+                        *, guild_id: int = 0, ipres: dict | None = None,
+                        ip_tag: str | None = None, ip_masked: str | None = None,
+                        reason: str = ""):
     uid = int(user["id"])
+    ipres = ipres or {"status": "unknown", "linked": [], "flags": []}
+    sub_label = {"hit": "⚠️ 該当", "clear": "✅ 非該当"}.get(ipres["status"], "❔ 判定不可（IPを取得できません）")
+    # ダッシュボード用に記録（チャンネルへ送れなくても残す）
+    append_auth_log({"t": int(time.time()), "guild": guild_id, "user": uid,
+                     "name": user.get("username"), "passed": passed, "blacklisted": blacklisted,
+                     "sub": ipres["status"], "linked": ipres["linked"][:20],
+                     "flags": [[k, v] for k, v in ipres["flags"]][:10],
+                     "ip": ip_tag, "ip_masked": ip_masked, "reason": reason,
+                     "age_days": age.days})
+
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
     if user.get("avatar"):
         avatar = f"https://cdn.discordapp.com/avatars/{uid}/{user['avatar']}.png?size=256"
     else:
@@ -1818,28 +2887,36 @@ async def send_auth_log(channel_id: int, user: dict, role: discord.Role | None,
     age_str = f"アカウント作成から {age.days}日{age.seconds // 3600}時間"
 
     if passed:
-        title, color = "✨ ユーザー認証ログ", 0x00FF00
-        sub = f"なし ({age_str})"
+        title, color = "✨ ユーザー認証ログ", 0x00FF00 if ipres["status"] != "hit" else 0xF59E0B
         role_text = f"✅ 付与完了 ({role.mention})"
     elif blacklisted:
         title, color = "🚫 ブラックリスト拒否ログ", 0xEF4444
-        sub = "🚫 ブラックリストに登録されたユーザー"
         role_text = "❌ 付与なし (ブロック)"
     else:
         title, color = "⛔ 認証拒否ログ", 0xEF4444
-        sub = f"⚠️ あり ({age_str} / {MIN_ACCOUNT_AGE_DAYS}日未満)"
         role_text = "❌ 付与なし (認証拒否)"
 
-    embed = discord.Embed(title=title, color=color,
-                          timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=avatar)
-    embed.add_field(name="👤 ユーザー",
-                    value=f"<@{uid}> (`{user['username']}`)", inline=False)
+    embed.add_field(name="👤 ユーザー", value=f"<@{uid}> (`{user['username']}`)", inline=False)
     embed.add_field(name="🆔 ユーザーID", value=f"`{uid}`", inline=False)
     embed.add_field(name="📅 認証日時", value=date_str, inline=False)
-    embed.add_field(name="🛡️ サブアカウント判定", value=sub, inline=False)
+    embed.add_field(name="🛡️ サブアカウント検知", value=sub_label, inline=True)
+    embed.add_field(name="🌐 IP識別子", value=f"`{ip_tag[:10]}`" if ip_tag else "-", inline=True)
+    embed.add_field(name="🕒 アカウント年齢", value=age_str, inline=True)
+    if ipres["linked"]:
+        lst = " ".join(f"<@{u}>" for u in ipres["linked"][:10])
+        more = f" ほか{len(ipres['linked']) - 10}件" if len(ipres["linked"]) > 10 else ""
+        embed.add_field(name=f"👥 同一IPで認証済みのアカウント（{len(ipres['linked'])}件）",
+                        value=lst + more, inline=False)
+    if ipres["flags"]:
+        embed.add_field(name="🚨 IP連携の警告",
+                        value="\n".join(f"・{FLAG_LABEL.get(k, k)}（<@{v}>）と同一IP"
+                                        for k, v in ipres["flags"][:5]), inline=False)
+    if reason:
+        embed.add_field(name="📄 判定理由", value=reason[:500], inline=False)
     embed.add_field(name="🏷️ ロール付与状況", value=role_text, inline=False)
-    await channel.send(embed=embed)
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ---------- 結果ページ ----------
@@ -1979,7 +3056,13 @@ TERMS_SECTIONS = [
                 "本ボットの運営を妨害する行為、または他のユーザーに迷惑をかける行為",
                 "その他、当方が不適切と判断する行為"]),
     ]),
-    ("第4条（免責事項）", [
+    ("第4条（不正防止のための情報の取得）", [
+        ("p", "本ボットは、サブアカウントによる認証やBAN回避などの不正を防ぐため、認証時に接続元の"
+              "IPアドレスを取得し、記録します。ユーザーは、認証を行うことで、これに同意したものとみなされます。"),
+        ("p", "同じIPアドレスから複数のアカウントが認証された場合や、利用制限を受けたアカウントと同じ"
+              "IPアドレスからの認証は、サブアカウントと判定され、認証が制限されることがあります。"),
+    ]),
+    ("第5条（免責事項）", [
         ("p", "当方は、本ボットの動作にバグや中断がないことを保証するものではありません。"),
         ("p", "本ボットの利用または利用不能によってユーザーに生じた損害について、"
               "当方に故意または重大な過失がある場合を除き、一切の責任を負いません。"),
@@ -1994,29 +3077,59 @@ PRIVACY_SECTIONS = [
         ("p", "本ボットのOAuth2認証機能を利用する際、以下の情報を取得する場合があります。"),
         ("ul", ["DiscordのユーザーID、ユーザー名（識別・認証のため）、アバター",
                 "認証時に許可された最小限のスコープ（例：identify 等の基本情報）",
-                "認証と同時に、対象のサーバーへ自動で参加させるための許可（guilds.join）"]),
+                "認証と同時に、対象のサーバーへ自動で参加させるための許可（guilds.join）",
+                "認証ページへアクセスした際の接続元IPアドレス（IPv6の場合は回線単位にまとめたもの）、"
+                "および認証した日時・サーバー"]),
     ]),
     ("2. 情報の利用目的", [
         ("p", "取得した情報は、以下の目的のためにのみ利用します。"),
         ("ul", ["Discordサーバーにおけるユーザーの本人確認およびロールの自動付与",
-                "認証に関するログの記録、および不正アクセスの防止・トラブルシューティング"]),
+                "認証に関するログの記録、および不正アクセスの防止・トラブルシューティング",
+                "同一IPアドレスからの複数アカウントの認証（サブアカウント）の検知",
+                "Global BAN（本ボット導入サーバー全体での利用禁止）、ブラックリスト、"
+                "サーバーごとのBANの対象者によるBAN回避の検知・防止",
+                "短時間の大量アクセスなど、攻撃的な利用の検知（レート制限）"]),
     ]),
-    ("3. 第三者提供の制限", [
+    ("3. IPアドレスの取扱い", [
+        ("ul", ["IPアドレスは、元に戻せない鍵付きハッシュ値と、末尾を伏せた形式（例：203.0.113.xxx）に"
+                "変換して保存します。サーバーの運営上必要な場合に限り、元のIPアドレスを保存することがあります。",
+                "保存したIP情報は、本ボットを導入している複数のサーバー間で、上記のセキュリティ目的に限り"
+                "照合・共有します（他のサーバーの管理者へIPアドレスそのものを開示することはありません）。",
+                "各サーバーの管理者には、認証ログとして「サブアカウント検知：該当 / 非該当」の判定結果、"
+                "同一IPで認証したアカウント、およびIPの識別子（ハッシュの一部）を表示します。",
+                f"IP情報は、最後の認証から{IP_RETENTION_DAYS}日を過ぎたものから順に自動で削除します。"]),
+    ]),
+    ("4. 第三者提供の制限", [
         ("p", "当方は、法令に基づく場合を除き、ユーザーの同意を得ることなく、"
               "取得した個人情報を第三者に提供することはありません。"),
+        ("p", "なお、本ボットの運用のため、通信経路（Cloudflare等）やデータの保存先（Upstash等）の"
+              "外部サービスを利用しており、これらのサービス上で情報が処理・保存されます。"),
     ]),
-    ("4. データの管理", [
+    ("5. データの管理", [
         ("p", "取得した情報は、不正アクセスや漏洩を防ぐために適切な管理を行います。"
+              "管理画面はボットの運営者のみが、Discordアカウントでのログインにより閲覧できます。"
               "また、不要となったデータは定期的に削除または匿名化に努めます。"),
     ]),
-    ("5. データの開示・削除", [
+    ("6. データの開示・削除", [
         ("p", "ユーザーから取得した情報の開示、修正、または削除の希望があった場合、"
-              "本人確認を行った上で、法令および合理的な範囲で速やかに対応いたします。"),
+              "本人確認を行った上で、法令および合理的な範囲で速やかに対応いたします。"
+              "ただし、不正防止のために必要な記録は、保存期間内は削除をお断りする場合があります。"),
     ]),
-    ("6. お問い合わせ", [
+    ("7. お問い合わせ", [
         ("p", "本ポリシーに関するお問い合わせは、当サーバーの管理メンバー（または管理者）までご連絡ください。"),
     ]),
 ]
+
+
+AUTH_NOTICE_HTML = """
+<div style="max-width:440px;margin:18px auto 24px;padding:12px 16px;border-radius:12px;
+background:rgba(255,255,255,.05);border:1px solid rgba(148,163,184,.25);color:#9ca3af;
+font:13px/1.7 system-ui,-apple-system,'Hiragino Sans','Noto Sans JP',sans-serif;text-align:left">
+🔒 認証すると、DiscordのユーザーID・アカウント名に加え、<b style="color:#e5e7eb">IPアドレス</b>を
+サブアカウント・BAN回避の検知などセキュリティ目的で取得・保存します。認証を続けると、
+<a href="/terms" style="color:#93c5fd">利用規約</a>と
+<a href="/privacy" style="color:#93c5fd">プライバシーポリシー</a>に同意したものとみなされます。
+</div>"""
 
 
 def legal_page(title: str, intro: str, sections: list, current: str) -> HTMLResponse:
@@ -2084,6 +3197,11 @@ async def index(request: Request, guild: int | None = None):
     page = INDEX_PATH.read_text(encoding="utf-8")
     # ログインボタンのリンクに guild を引き継ぐ
     page = page.replace("/login", f"/login?guild={guild}")
+    # IPアドレスの取得について、認証ボタンのページで必ず案内する
+    if "</body>" in page:
+        page = page.replace("</body>", AUTH_NOTICE_HTML + "</body>", 1)
+    else:
+        page += AUTH_NOTICE_HTML
     return HTMLResponse(page)
 
 
@@ -2186,53 +3304,66 @@ async def callback(request: Request, code: str | None = None, state: str | None 
         user_id = int(user["id"])
         username = user.get("global_name") or user["username"]
 
-        # 2.5) アカウント作成日数チェック（サブアカウント対策）
-        age = datetime.now(timezone.utc) - discord.utils.snowflake_time(user_id)
+        age = datetime.now(timezone.utc) - discord.utils.snowflake_time(user_id)  # ログ表示用
+
+        # 2.3) 接続元IP（サブアカウント検知・GBAN/ブラックリスト連携に使う）
+        norm_ip = normalize_ip(client_ip(request))
+        h = ip_hash(norm_ip) if norm_ip else None
+        masked = mask_ip(norm_ip) if norm_ip else None
+
+        async def deny_log(reason: str, *, blacklisted: bool, ipres: dict | None = None):
+            try:
+                await asyncio.wait_for(bot.wait_until_ready(), READY_TIMEOUT)
+                await send_auth_log(log_channel_id, user, None, age, False, blacklisted=blacklisted,
+                                    guild_id=guild_id, ipres=ipres, ip_tag=h, ip_masked=masked,
+                                    reason=reason)
+            except Exception as e:
+                print(f"認証ログ送信エラー: {safe_error(e)}")
+
+        # 拒否された場合も、IPは記録する（同じIPからの別アカウントを検知するため）
+        def remember_ip():
+            if h:
+                try:
+                    record_ip(h, norm_ip, user_id, guild_id)
+                except Exception as e:
+                    print(f"IPの記録に失敗: {safe_error(e)}")
 
         # 2.4) ブラックリストのユーザーはブロック
         if is_user_blacklisted(user_id):
-            try:
-                await asyncio.wait_for(bot.wait_until_ready(), READY_TIMEOUT)
-                await send_auth_log(log_channel_id, user, None, age, False,
-                                    blacklisted=True)
-            except Exception as e:
-                print(f"認証ログ送信エラー: {e}")
+            remember_ip()
+            await deny_log("Botのブラックリストに登録されたユーザー", blacklisted=True)
             return blocked_page("認証できません",
                                 "このアカウントは、認証の利用が制限されています。"
                                 "心当たりがない場合は、サーバーの管理者にお問い合わせください。")
         # 2.45) このサーバーのブラックリスト
         if is_server_user_blacklisted(guild_id, user_id):
-            try:
-                await asyncio.wait_for(bot.wait_until_ready(), READY_TIMEOUT)
-                await send_auth_log(log_channel_id, user, None, age, False,
-                                    blacklisted=True)
-            except Exception as e:
-                print(f"認証ログ送信エラー: {e}")
+            remember_ip()
+            await deny_log("このサーバーのブラックリストに登録されたユーザー", blacklisted=True)
             return blocked_page("認証できません",
                                 "このサーバーでは、あなたのアカウントの認証が制限されています。"
                                 "心当たりがない場合は、サーバーの管理者にお問い合わせください。")
 
         # 2.46) GBAN（グローバルBAN）されたユーザーは、サーバーに参加させる前にブロック
         if await gban_get(user_id) is not None:
-            try:
-                await asyncio.wait_for(bot.wait_until_ready(), READY_TIMEOUT)
-                await send_auth_log(log_channel_id, user, None, age, False,
-                                    blacklisted=True)
-            except Exception as e:
-                print(f"認証ログ送信エラー: {e}")
+            remember_ip()
+            await deny_log("Global BAN登録ユーザー", blacklisted=True)
             return blocked_page("認証できません",
                                 "このアカウントは、認証の利用が制限されています。")
 
-        if age < timedelta(days=MIN_ACCOUNT_AGE_DAYS):
-            try:
-                await asyncio.wait_for(bot.wait_until_ready(), READY_TIMEOUT)
-                await send_auth_log(log_channel_id, user, None, age, False)
-            except Exception as e:
-                print(f"認証ログ送信エラー: {e}")
+        # 2.5) 同一IPによるサブアカウント検知（BAN・ブラックリスト対象と同一IPならBAN回避としてブロック）
+        ipres = await check_ip_links(h, user_id, guild_id)
+        remember_ip()
+        if ipres["block"]:
+            if ipres["flags"]:
+                why = "、".join(sorted({FLAG_LABEL.get(k, k) for k, _ in ipres["flags"]}))
+                reason = f"制限対象のアカウント（{why}）と同じIPからの認証"
+            else:
+                reason = "このサーバーで認証済みの別アカウントと同じIPからの認証（サブアカウント）"
+            await deny_log(reason, blacklisted=bool(ipres["flags"]), ipres=ipres)
             return result_page(
                 False, "認証できません",
-                f"アカウント作成から{MIN_ACCOUNT_AGE_DAYS}日以上経過している必要があります。"
-                "時間をおいてから再度お試しください。")
+                "同じネットワークから、すでに別のアカウントが認証されているため、"
+                "サブアカウントと判定されました。心当たりがない場合は、サーバーの管理者にお問い合わせください。")
 
         # 3) ロール付与 + 認証ログ
         try:
@@ -2269,9 +3400,11 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
             # --- 認証ログ送信（失敗しても認証自体は成功扱い） ---
             try:
-                await send_auth_log(log_channel_id, user, role, age, True)
+                await send_auth_log(log_channel_id, user, role, age, True, guild_id=guild_id,
+                                    ipres=ipres, ip_tag=h, ip_masked=masked,
+                                    reason="同一IPのアカウントあり（記録のみ）" if ipres["status"] == "hit" else "")
             except Exception as e:
-                print(f"認証ログ送信エラー: {e}")
+                print(f"認証ログ送信エラー: {safe_error(e)}")
 
         except asyncio.TimeoutError:
             return result_page(False, "Botが起動中です",
@@ -2284,6 +3417,24 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 
     return result_page(True, "認証完了",
                        f"{username} さん、認証が完了しました。Discordに戻ってください。")
+
+
+# ---------- 所有者専用ダッシュボード（/dashboard） ----------
+from types import SimpleNamespace  # noqa: E402
+
+dashboard.register(app, SimpleNamespace(
+    bot=bot, client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
+    base_url=lambda: BASE_URL or f"http://localhost:{PORT}",  # クイックトンネルで後から変わるので関数で渡す
+    get_owner_ids=bot.get_owner_ids, limiter=limiter, client_ip=client_ip,
+    send_security_alert=send_security_alert, log_buffer=LOG_BUFFER, boot_time=BOOT_TIME,
+    storage_remote=storage.remote, redis_client=redis_client,
+    load_auth_logs=load_auth_logs, load_incidents=load_incidents,
+    load_license=load_license, save_license=save_license,
+    load_blacklist=load_blacklist, save_blacklist=save_blacklist,
+    load_ip_index=load_ip_index, load_defense_config=load_defense_config, load_config=load_config,
+    gban_list=gban_list, gban_add_all=gban_add_all, gban_del=gban_del,
+    ip_retention_days=IP_RETENTION_DAYS,
+))
 
 
 # ---------- Cloudflare クイックトンネル ----------
@@ -2360,7 +3511,12 @@ if __name__ == "__main__":
                          ("blacklist", BLACKLIST_FILE),
                          ("server_blacklist", SERVER_BLACKLIST_FILE),
                          ("defense_config", DEFENSE_CONFIG_FILE), ("server_backups", BACKUP_DATA_FILE),
-                         ("license", LICENSE_FILE), ("status_message", STATUS_FILE)])
+                         ("license", LICENSE_FILE), ("status_message", STATUS_FILE),
+                         ("ip_index", IP_INDEX_FILE), ("auth_logs", AUTH_LOG_FILE),
+                         ("security_incidents", INCIDENT_FILE), ("ticket_config", TICKET_CONFIG_FILE),
+                         ("subaccount_config", SUBACCOUNT_CONFIG_FILE),
+                         ("weather_config", Path("weather_config.json")),
+                         ("disaster_config", Path("disaster_config.json"))])
     except Exception as e:
         raise SystemExit("設定の読み込みに失敗しました（Upstashに接続できません）: "
                          f"{safe_error(e)}")
@@ -2381,10 +3537,13 @@ if __name__ == "__main__":
             print("Cloudflare Tunnel 起動成功")
             print(f"公開URL     : {BASE_URL}")
             print(f"Redirect URI: {REDIRECT_URI}")
-            print("→ Developer Portal の OAuth2 > Redirects に上のURLを登録してください")
+            print(f"ダッシュボード: {BASE_URL}/dashboard （Redirect: {BASE_URL}/dashboard/callback）")
+            print("→ Developer Portal の OAuth2 > Redirects に、上の2つのURLを登録してください")
             print("=" * 60)
 
     if not REDIRECT_URI:
         raise SystemExit("REDIRECT_URI が決まりません。トンネルの起動に失敗したか、"
                          ".env に REDIRECT_URI を設定してください。")
+    print(f"所有者専用ダッシュボード: {BASE_URL}/dashboard"
+          f"（OAuth2 Redirects に {BASE_URL}/dashboard/callback の登録が必要）")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
