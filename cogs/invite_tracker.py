@@ -208,12 +208,50 @@ class InviteTracker(commands.Cog):
         return f"{sec // 60}分"
 
     async def _log(self, guild: discord.Guild, embed: discord.Embed):
+        """送信先: /invite-log で指定したチャンネル → /set-log-channel のチャンネル の順。"""
+        cid = self.bot.store_load("invite_log_config").get(str(guild.id))
+        ch = guild.get_channel(int(cid)) if cid else None
+        if isinstance(ch, discord.TextChannel):
+            try:
+                await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                return
+            except discord.HTTPException as e:
+                print(f"招待ログの送信に失敗 ({guild.id}): {type(e).__name__}")
         fn = getattr(self.bot, "guild_log", None)
         if fn:
             try:
                 await fn(guild, embed)
             except Exception as e:
                 print(f"招待ログの送信に失敗: {type(e).__name__}")
+
+    @app_commands.command(name="invite-log", description="招待リンクの作成・メンバー参加（招待元）のログを送るチャンネルを設定します")
+    @app_commands.describe(channel="送信先（省略すると解除して /set-log-channel のチャンネルに戻します）")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def invite_log(self, interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+        data = self.bot.store_load("invite_log_config")
+        if channel is None:
+            data.pop(str(interaction.guild_id), None)
+            self.bot.store_save("invite_log_config", data)
+            await interaction.response.send_message(
+                "✅ 解除しました。招待ログは `/set-log-channel` のチャンネルに送られます（未設定なら送られません）。",
+                ephemeral=True)
+            return
+        p = channel.permissions_for(interaction.guild.me)
+        if not (p.view_channel and p.send_messages and p.embed_links):
+            await interaction.response.send_message(
+                f"{channel.mention} でBotに「チャンネルを見る・メッセージを送信・埋め込みリンク」権限が必要です。", ephemeral=True)
+            return
+        data[str(interaction.guild_id)] = channel.id
+        self.bot.store_save("invite_log_config", data)
+        warn = []
+        if not interaction.guild.me.guild_permissions.manage_guild:
+            warn.append("Botに「サーバーの管理」権限がないため、招待リンクの特定ができません")
+        if not self.bot.intents.members:
+            warn.append("メンバーIntentが無効のため、参加時のログは届きません（ENABLE_MEMBERS_INTENT=1）")
+        await interaction.response.send_message(
+            f"✅ 招待リンクの作成・メンバー参加のログを {channel.mention} に送ります。"
+            + "".join(f"\n⚠️ {w}" for w in warn), ephemeral=True)
 
     # ---------- 参加時の特定 ----------
     @commands.Cog.listener()

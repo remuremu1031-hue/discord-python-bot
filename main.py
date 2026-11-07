@@ -629,7 +629,7 @@ KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
                  "nuke-whitelist", "subaccount", "transcript-channel", "help",
-                 "weather", "disaster", "sticky", "invite-stats"}  # 残すスラッシュコマンド
+                 "weather", "disaster", "sticky", "invite-stats", "invite-log"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
@@ -3552,6 +3552,7 @@ if __name__ == "__main__":
                          ("security_incidents", INCIDENT_FILE), ("ticket_config", TICKET_CONFIG_FILE),
                          ("subaccount_config", SUBACCOUNT_CONFIG_FILE),
                          ("weather_config", Path("weather_config.json")),
+                         ("invite_log_config", Path("invite_log_config.json")),
                          ("disaster_config", Path("disaster_config.json"))])
     except Exception as e:
         raise SystemExit("設定の読み込みに失敗しました（Upstashに接続できません）: "

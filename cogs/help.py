@@ -9,7 +9,7 @@ CATEGORIES = [
     ("🔐 認証", ["setup", "authlink", "panel", "subaccount", "server-blacklist"]),
     ("🛡️ セキュリティ", ["nuke-defense", "nuke-whitelist", "backup", "set-log-channel", "automod", "eventlog"]),
     ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "mass_role"]),
-    ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "invite-stats", "weather",
+    ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "invite-log", "invite-stats", "weather",
                     "disaster", "broadcast-channel", "help"]),
     ("👑 オーナー専用", ["broadcast", "blacklist", "license", "gban"]),
 ]
@@ -18,6 +18,8 @@ GUIDE = {
     "sticky": "① `/sticky set text:本文` で登録（`title` を入れると埋め込み、`button_label`+`button_url` でリンクボタン）\n"
               "② 誰かが投稿するたびに、古い案内を消して一番下に貼り直します\n"
               "・`/sticky copy message_id:ID` で既存メッセージを流用 ・`/sticky remove` で解除 ・`/sticky list` で一覧",
+    "invite-log": "招待リンクの作成と、メンバー参加時の招待元（作成者・作成日時）のログを送るチャンネルを設定します。"
+                  "未設定なら `/set-log-channel` のチャンネルに送ります。",
     "invite-stats": "招待リンクの作成（URL・有効期限・作成者の累計作成数）と、メンバー参加時の招待元（作成者・作成日時）を"
                     "ログチャンネルに自動で記録します。認証ログにも招待元が表示されます。\n"
                     "・`/invite-stats user:@ユーザー` で累計作成数と有効なリンクを確認\n"
@@ -29,7 +31,7 @@ GUIDE = {
     "nuke-whitelist": "Nuke検知の対象外にする信頼済みのユーザー・BOTを登録します。",
     "backup": "`create` で保存、`list` で一覧、`restore number:番号` で足りないロール・チャンネルを作り直します。",
     "transcript-channel": "チケットのトランスクリプト（HTML＋テキスト）を送るチャンネルを設定します。",
-    "reactionrole": "`menu-create` → `menu-add`（ロールを追加）→ `menu-send` で、何個でも同時に選べるロールメニューを作れます。従来の絵文字リアクション方式は `add` / `remove` / `list`。",
+    "reactionrole": "`menu-create` → `menu-add`（一度に5個まで追加）→ `menu-send` で、何個でも同時に選べるロールメニューを作れます。従来の絵文字リアクション方式は `add` / `remove` / `list`。",
     "weather": "`set channel times:07:00,18:00` で全国の天気予報を毎日自動投稿します。`now` で今すぐ表示。",
     "disaster": "`set` で津波・火山・気象警報（と地震）を自動通知します。\n"
                 "`quake` で地震情報だけを別チャンネルに分離（最小震度・メンションロールも個別に設定）、`quake-off` で分離解除。\n"
