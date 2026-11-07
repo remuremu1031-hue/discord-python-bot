@@ -3230,6 +3230,9 @@ async def index(request: Request, guild: int | None = None):
     page = INDEX_PATH.read_text(encoding="utf-8")
     # ログインボタンのリンクに guild を引き継ぐ
     page = page.replace("/login", f"/login?guild={guild}")
+    # index.html にある「取得する情報は、ユーザーIDとアカウント名のみです。」の一文を、要素ごと取り除く
+    page = re.sub(r"<(p|div|small|span)\b[^>]*>[^<]*取得する情報は[^<]*</\1>", "", page)
+    page = re.sub(r"[^<>]*取得する情報は[^<>]*のみです。?", "", page)  # 要素で囲まれていない場合
     # IPアドレスの取得について、認証ボタンのページで必ず案内する
     if "</body>" in page:
         page = page.replace("</body>", AUTH_NOTICE_HTML + "</body>", 1)
