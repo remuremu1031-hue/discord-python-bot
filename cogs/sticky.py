@@ -4,13 +4,90 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-import redis_kv as kv
+
+class kv:
+    """Redisの小さなヘルパー（main.py の bot.kv を使う）。
+    Redis が未設定・一時的に失敗したときは、メモリに保存して動き続ける（再起動で消える）。"""
+    _mem: dict = {}
+    _exp: dict = {}
+
+    @classmethod
+    def _alive(cls, key):
+        if key in cls._exp and cls._exp[key] < time.time():
+            cls._mem.pop(key, None)
+            cls._exp.pop(key, None)
+        return key in cls._mem
+
+    @staticmethod
+    async def _do(bot, op, *args):
+        if getattr(bot, "kv_ready", lambda: False)():
+            try:
+                return True, await bot.kv(op, *args)
+            except Exception as e:
+                print(f"Redisの操作に失敗（{op}）: {type(e).__name__}")
+        return False, None
+
+    @classmethod
+    async def get_json(cls, bot, key, default=None):
+        ok, v = await cls._do(bot, "get", key)
+        if ok:
+            try:
+                return json.loads(v) if v else default
+            except Exception:
+                return default
+        return cls._mem.get(key, default) if cls._alive(key) else default
+
+    @classmethod
+    async def set_json(cls, bot, key, value, ttl=None):
+        ok, _ = await cls._do(bot, "set", key, json.dumps(value, ensure_ascii=False), *(["ex", ttl] if ttl else []))
+        if not ok:
+            cls._mem[key] = value
+            if ttl:
+                cls._exp[key] = time.time() + ttl
+
+    @classmethod
+    async def incr(cls, bot, key):
+        ok, v = await cls._do(bot, "incr", key)
+        if ok:
+            return int(v)
+        cls._mem[key] = int(cls._mem.get(key, 0) or 0) + 1
+        return cls._mem[key]
+
+    @classmethod
+    async def get_int(cls, bot, key):
+        ok, v = await cls._do(bot, "get", key)
+        return int(v or 0) if ok else int(cls._mem.get(key, 0) or 0)
+
+    @classmethod
+    async def hgetall(cls, bot, key):
+        ok, v = await cls._do(bot, "hgetall", key)
+        out = {}
+        for k, val in ((v if ok else cls._mem.get(key, {})) or {}).items():
+            try:
+                out[k] = json.loads(val) if isinstance(val, str) else val
+            except Exception:
+                pass
+        return out
+
+    @classmethod
+    async def hset(cls, bot, key, field, value):
+        raw = json.dumps(value, ensure_ascii=False)
+        ok, _ = await cls._do(bot, "hset", key, field, raw)
+        if not ok:
+            cls._mem.setdefault(key, {})[field] = raw
+
+    @classmethod
+    async def hdel(cls, bot, key, field):
+        ok, _ = await cls._do(bot, "hdel", key, field)
+        if not ok:
+            cls._mem.get(key, {}).pop(field, None)
 
 DELAY = 4  # 最後の投稿からこの秒数たってから貼り直す（連投時の連続再投稿を防ぐ）
 
