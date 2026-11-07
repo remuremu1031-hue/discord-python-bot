@@ -191,13 +191,17 @@ class JMAAlerts(commands.Cog):
                            min_intensity: str = "3", weather_level: str = "special",
                            area: str | None = None, mention_role: discord.Role | None = None):
         data = self.bot.store_load("disaster_config")
-        data[str(interaction.guild_id)] = {"channel": channel.id, "min_int": min_intensity,
-                                           "weather": weather_level, "area": (area or "").strip()[:20],
-                                           "role": mention_role.id if mention_role else None}
+        cur = data.get(str(interaction.guild_id), {})
+        cur.update({"channel": channel.id, "min_int": min_intensity,
+                    "weather": weather_level, "area": (area or "").strip()[:20],
+                    "role": mention_role.id if mention_role else None})
+        data[str(interaction.guild_id)] = cur
         self.bot.store_save("disaster_config", data)
         await interaction.response.send_message(
-            f"✅ {channel.mention} に災害情報を通知します\n・地震: 震度{INT_LABEL.get(min_intensity, min_intensity)}以上\n"
-            f"・津波・噴火: 常に通知\n・気象: {dict(special='特別警報のみ', warning='警報など', off='通知しない')[weather_level]}"
+            f"✅ {channel.mention} に災害情報を通知します\n"
+            + (f"・地震: <#{cur['quake_channel']}> に分離中（`/disaster quake` の設定）\n" if cur.get("quake_channel")
+               else f"・地震: 震度{INT_LABEL.get(min_intensity, min_intensity)}以上（`/disaster quake` で別チャンネルに分離できます）\n")
+            + f"・津波・噴火: 常に通知\n・気象: {dict(special='特別警報のみ', warning='警報など', off='通知しない')[weather_level]}"
             + (f"（地域: {area}）" if area else "") + "\n※ 緊急地震速報（EEW）は気象庁が一般公開していないため対象外です。",
             ephemeral=True)
 
@@ -206,21 +210,60 @@ class JMAAlerts(commands.Cog):
         data = self.bot.store_load("disaster_config")
         data.pop(str(interaction.guild_id), None)
         self.bot.store_save("disaster_config", data)
-        await interaction.response.send_message("🔕 災害情報の自動通知を停止しました。", ephemeral=True)
+        await interaction.response.send_message("🔕 災害情報（地震を含む）の自動通知をすべて停止しました。", ephemeral=True)
+
+    @disaster.command(name="quake", description="地震情報だけを、別のチャンネルに通知するよう設定します")
+    @app_commands.describe(channel="地震情報の通知先", min_intensity="通知する最小震度",
+                           mention_role="震度5弱以上のときにメンションするロール（任意）")
+    @app_commands.choices(
+        min_intensity=[app_commands.Choice(name=f"震度{INT_LABEL.get(v, v)}以上", value=v) for v in INT_ORDER[:7]])
+    async def disaster_quake(self, interaction: discord.Interaction, channel: discord.TextChannel,
+                             min_intensity: str = "3", mention_role: discord.Role | None = None):
+        data = self.bot.store_load("disaster_config")
+        cur = data.setdefault(str(interaction.guild_id), {})
+        cur.update({"quake_channel": channel.id, "quake_min_int": min_intensity,
+                    "quake_role": mention_role.id if mention_role else None})
+        self.bot.store_save("disaster_config", data)
+        other = f"<#{cur['channel']}>" if cur.get("channel") else "未設定（`/disaster set` で設定）"
+        await interaction.response.send_message(
+            f"🌏 地震情報は {channel.mention} に通知します（震度{INT_LABEL.get(min_intensity, min_intensity)}以上）。\n"
+            f"・津波・火山・気象警報の通知先: {other}", ephemeral=True)
+
+    @disaster.command(name="quake-off", description="地震情報の分離をやめます（地震は通常の通知先に戻ります）")
+    async def disaster_quake_off(self, interaction: discord.Interaction):
+        data = self.bot.store_load("disaster_config")
+        cur = data.get(str(interaction.guild_id), {})
+        for k in ("quake_channel", "quake_min_int", "quake_role"):
+            cur.pop(k, None)
+        if cur:
+            data[str(interaction.guild_id)] = cur
+        else:
+            data.pop(str(interaction.guild_id), None)
+        self.bot.store_save("disaster_config", data)
+        dest = f"<#{cur['channel']}>" if cur.get("channel") else "どこにも通知されません"
+        await interaction.response.send_message(f"✅ 地震情報の分離をやめました。地震情報は {dest}。", ephemeral=True)
 
     @disaster.command(name="test", description="通知先へテスト通知を送ります")
     async def disaster_test(self, interaction: discord.Interaction):
-        cfg = self.bot.store_load("disaster_config").get(str(interaction.guild_id))
-        ch = self.bot.get_channel(cfg["channel"]) if cfg else None
-        if ch is None:
-            await interaction.response.send_message("先に `/disaster set` で設定してください。", ephemeral=True)
+        cfg = self.bot.store_load("disaster_config").get(str(interaction.guild_id)) or {}
+        targets = []
+        if cfg.get("channel"):
+            targets.append((cfg["channel"], "津波・火山・気象警報" if cfg.get("quake_channel") else "地震・津波・火山・気象警報"))
+        if cfg.get("quake_channel"):
+            targets.append((cfg["quake_channel"], "地震情報"))
+        if not targets:
+            await interaction.response.send_message("先に `/disaster set` か `/disaster quake` で設定してください。", ephemeral=True)
             return
-        try:
-            await ch.send(embed=discord.Embed(title="🧪 災害情報通知のテスト", color=0x6B7280,
-                                              description="このチャンネルに、地震・津波・火山・気象警報が届きます。"))
-            await interaction.response.send_message("✅ 送信しました。", ephemeral=True)
-        except discord.HTTPException:
-            await interaction.response.send_message("❌ 送信できません。Botの権限を確認してください。", ephemeral=True)
+        results = []
+        for cid, what in targets:
+            ch = self.bot.get_channel(cid)
+            try:
+                await ch.send(embed=discord.Embed(title="🧪 災害情報通知のテスト", color=0x6B7280,
+                                                  description=f"このチャンネルに、{what}が届きます。"))
+                results.append(f"✅ <#{cid}>（{what}）")
+            except (discord.HTTPException, AttributeError):
+                results.append(f"❌ <#{cid}>（{what}）送信できません。Botの権限を確認してください")
+        await interaction.response.send_message("\n".join(results), ephemeral=True)
 
     async def _get(self, url: str):
         h = {}
@@ -318,7 +361,8 @@ class JMAAlerts(commands.Cog):
             for gid, cfg in configs.items():
                 if self._suspended(int(gid)) or not self._wants(cfg, item):
                     continue
-                ch = self.bot.get_channel(cfg["channel"])
+                quake_sep = item["kind"] == "quake" and cfg.get("quake_channel")
+                ch = self.bot.get_channel(cfg["quake_channel"] if quake_sep else cfg.get("channel") or 0)
                 if ch is None:
                     continue
                 sent = [t for t in self._sent_count.get(int(gid), []) if time.time() - t < 600]
@@ -326,7 +370,7 @@ class JMAAlerts(commands.Cog):
                     continue  # 大量発表時の連投を抑える（重大な情報は必ず送る）
                 sent.append(time.time())
                 self._sent_count[int(gid)] = sent
-                role = cfg.get("role") if item["severe"] else None
+                role = (cfg.get("quake_role") if quake_sep else cfg.get("role")) if item["severe"] else None
                 try:
                     await ch.send(content=f"<@&{role}>" if role else None, embed=item["embed"],
                                   allowed_mentions=discord.AllowedMentions(roles=True))
@@ -337,7 +381,11 @@ class JMAAlerts(commands.Cog):
     @staticmethod
     def _wants(cfg: dict, item: dict) -> bool:
         if item["kind"] == "quake":
-            return _int_rank(item["int"]) >= _int_rank(cfg.get("min_int", "3"))
+            if cfg.get("quake_channel"):
+                return _int_rank(item["int"]) >= _int_rank(cfg.get("quake_min_int", "3"))
+            return bool(cfg.get("channel")) and _int_rank(item["int"]) >= _int_rank(cfg.get("min_int", "3"))
+        if not cfg.get("channel"):
+            return False  # 地震だけを設定しているサーバー
         if item.get("cat") == "weather":
             lv = cfg.get("weather", "special")
             if lv == "off" or (lv == "special" and not item["severe"]):
