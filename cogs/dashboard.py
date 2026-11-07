@@ -93,7 +93,7 @@ def _secure_headers(resp: Response) -> Response:
     return resp
 
 
-def register(app, ctx) -> None:
+def register(app, ctx):
     """ctx に必要なもの（main.py が用意）:
     bot, client_id, client_secret, base_url()（関数）, get_owner_ids(), limiter, client_ip(),
     send_security_alert(), log_buffer, boot_time, storage_remote, redis_client(), load_auth_logs(),
@@ -101,7 +101,8 @@ def register(app, ctx) -> None:
     load_defense_config(), load_config(), gban_list(), gban_add_all(), gban_del(), ip_retention_days"""
 
     def redirect_uri() -> str:
-        return ctx.base_url() + "/dashboard/callback"
+        # 認証で登録済みの /callback をそのまま使う（state が "dash_" で始まるものを main.py がこちらへ回す）
+        return ctx.oauth_redirect_uri()
 
     def cookie_secure() -> bool:
         return ctx.base_url().startswith("https://")
@@ -389,14 +390,14 @@ def register(app, ctx) -> None:
         now = time.time()
         for k in [k for k, v in _states.items() if now - v > 600]:
             _states.pop(k, None)
-        state = secrets.token_urlsafe(24)
+        state = "dash_" + secrets.token_urlsafe(24)
         _states[state] = now
         params = httpx.QueryParams({"client_id": ctx.client_id, "redirect_uri": redirect_uri(),
                                     "response_type": "code", "scope": "identify", "state": state,
                                     "prompt": "none"})
         resp = RedirectResponse(f"https://discord.com/oauth2/authorize?{params}", status_code=303)
         resp.set_cookie(STATE_COOKIE, state, max_age=600, httponly=True, secure=cookie_secure(),
-                        samesite="lax", path="/dashboard")
+                        samesite="lax", path="/")  # /callback でも受け取れるように
         return _secure_headers(resp)
 
     def denied(title: str, text: str, status: int = 403) -> HTMLResponse:
@@ -407,9 +408,8 @@ def register(app, ctx) -> None:
                f'<a href="/dashboard/login">もう一度ログイン</a></div></body></html>')
         return _secure_headers(HTMLResponse(doc, status_code=status))
 
-    @app.get("/dashboard/callback")
-    @ctx.limiter.limit("15/minute")
     async def dashboard_callback(request: Request, code: str | None = None, state: str | None = None):
+        """main.py の /callback から呼ばれる（state が dash_ で始まるとき）。"""
         cookie_state = request.cookies.get(STATE_COOKIE)
         issued = _states.pop(state or "", None)
         if (not code or not state or issued is None or time.time() - issued > 600
@@ -421,9 +421,7 @@ def register(app, ctx) -> None:
                 "grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri()},
                 headers={"Content-Type": "application/x-www-form-urlencoded"})
             if r.status_code != 200:
-                return denied("ログインに失敗しました",
-                              "Discordとの通信に失敗しました（Developer PortalのRedirectsに "
-                              "/dashboard/callback が登録されているか確認してください）。", 400)
+                return denied("ログインに失敗しました", "Discordとの通信に失敗しました。もう一度お試しください。", 400)
             token = r.json().get("access_token")
             r = await http.get("https://discord.com/api/v10/users/@me",
                                headers={"Authorization": f"Bearer {token}"})
@@ -448,7 +446,7 @@ def register(app, ctx) -> None:
         resp = RedirectResponse("/dashboard", status_code=303)
         resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True, secure=cookie_secure(),
                         samesite="lax", path="/dashboard")
-        resp.delete_cookie(STATE_COOKIE, path="/dashboard")
+        resp.delete_cookie(STATE_COOKIE, path="/")
         return _secure_headers(resp)
 
     async def read_form(request: Request) -> dict[str, str]:
@@ -552,3 +550,5 @@ def register(app, ctx) -> None:
         resp = Response(body, media_type="application/json")
         resp.headers["Content-Disposition"] = f'attachment; filename="{kind}-{int(time.time())}.json"'
         return _secure_headers(resp)
+
+    return dashboard_callback

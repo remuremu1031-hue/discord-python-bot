@@ -134,7 +134,7 @@ ENABLE_MEMBERS_INTENT = os.getenv("ENABLE_MEMBERS_INTENT", "0") == "1"  # 参加
 STATUS_CHANNEL_ID = int(os.getenv("STATUS_CHANNEL_ID") or 0)  # 稼働状況を表示するチャンネル（0で無効）
 STATUS_INTERVAL_MINUTES = min(10, max(5, int(os.getenv("STATUS_INTERVAL_MINUTES") or 5)))  # 更新間隔（5〜10分）
 
-BASE_URL = REDIRECT_URI.removesuffix("/callback").rstrip("/")
+BASE_URL = REDIRECT_URI.strip().rstrip("/").removesuffix("/callback").rstrip("/")  # 末尾の / があっても正しく扱う
 API = "https://discord.com/api/v10"
 STATE_TTL = 600  # 秒
 CONFIG_FILE = Path("guild_config.json")  # サーバーごとの設定
@@ -3318,6 +3318,9 @@ async def login(request: Request, guild: int | None = None):
 async def callback(request: Request, code: str | None = None, state: str | None = None,
                    error: str | None = None,
                    invited_guild_id: str | None = Query(default=None, alias="guild_id")):
+    # ダッシュボードのログイン（state が dash_ で始まる）は、ダッシュボード側で処理する
+    if state and state.startswith("dash_"):
+        return await dashboard_callback(request, None if error else code, state)
     # ボット招待後のリダイレクト（guild_idあり・stateなし）はエラーにせず案内ページを返す
     if invited_guild_id and not state:
         return invite_done_page()
@@ -3499,9 +3502,10 @@ async def callback(request: Request, code: str | None = None, state: str | None 
 # ---------- 所有者専用ダッシュボード（/dashboard） ----------
 from types import SimpleNamespace  # noqa: E402
 
-dashboard.register(app, SimpleNamespace(
+dashboard_callback = dashboard.register(app, SimpleNamespace(
     bot=bot, client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
     base_url=lambda: BASE_URL or f"http://localhost:{PORT}",  # クイックトンネルで後から変わるので関数で渡す
+    oauth_redirect_uri=lambda: REDIRECT_URI,  # 認証と同じ /callback を使う（追加のRedirect登録は不要）
     get_owner_ids=bot.get_owner_ids, limiter=limiter, client_ip=client_ip,
     send_security_alert=send_security_alert, log_buffer=LOG_BUFFER, boot_time=BOOT_TIME,
     storage_remote=storage.remote, redis_client=redis_client,
@@ -3615,13 +3619,12 @@ if __name__ == "__main__":
             print("Cloudflare Tunnel 起動成功")
             print(f"公開URL     : {BASE_URL}")
             print(f"Redirect URI: {REDIRECT_URI}")
-            print(f"ダッシュボード: {BASE_URL}/dashboard （Redirect: {BASE_URL}/dashboard/callback）")
-            print("→ Developer Portal の OAuth2 > Redirects に、上の2つのURLを登録してください")
+            print(f"ダッシュボード: {BASE_URL}/dashboard")
+            print("→ Developer Portal の OAuth2 > Redirects に、上の Redirect URI を登録してください")
             print("=" * 60)
 
     if not REDIRECT_URI:
         raise SystemExit("REDIRECT_URI が決まりません。トンネルの起動に失敗したか、"
                          ".env に REDIRECT_URI を設定してください。")
-    print(f"所有者専用ダッシュボード: {BASE_URL}/dashboard"
-          f"（OAuth2 Redirects に {BASE_URL}/dashboard/callback の登録が必要）")
+    print(f"所有者専用ダッシュボード: {BASE_URL}/dashboard（ログインは認証と同じ {REDIRECT_URI} を使用）")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
