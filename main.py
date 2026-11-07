@@ -629,12 +629,12 @@ KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
                  "nuke-whitelist", "subaccount", "transcript-channel", "help",
-                 "weather", "disaster", "sticky", "invite-stats", "tts", "music"}  # 残すスラッシュコマンド
+                 "weather", "disaster", "sticky", "invite-stats"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
               "event_logs", "moderation", "automod",
-              "jma_alerts", "help", "sticky", "invite_tracker", "tts", "music"]  # cogs/ フォルダの追加機能
+              "jma_alerts", "help", "sticky", "invite_tracker"]  # cogs/ フォルダの追加機能
 
 # ファイル名の別名（例: reaction_role.py でも reaction_roles として読み込む）
 COG_ALIASES = {"reaction_roles": ["reaction_role"], "event_logs": ["event_log"],

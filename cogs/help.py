@@ -11,15 +11,17 @@ CATEGORIES = [
     ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "mass_role"]),
     ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "invite-stats", "weather",
                     "disaster", "broadcast-channel", "help"]),
-    ("🎵 VC（読み上げ・音楽）", ["tts", "music"]),
     ("👑 オーナー専用", ["broadcast", "blacklist", "license", "gban"]),
 ]
 OWNER_CAT = "👑 オーナー専用"
 GUIDE = {
-    "sticky": "`set` で案内メッセージを登録すると、新しい投稿があるたびに古い案内を消して一番下に貼り直します。`copy` で既存メッセージを流用できます。",
-    "invite-stats": "ユーザーが作成した招待リンクの累計数と、今有効なリンクを表示します。作成・参加の記録はログチャンネルに届きます。",
-    "tts": "VCに入って `/tts join` を実行すると、そのチャンネルの投稿を読み上げます。`;` で始めると読み上げません。",
-    "music": "`/music play 曲名またはURL` で再生。`skip` `pause` `resume` `queue` `loop` `volume` `stop` で操作します。",
+    "sticky": "① `/sticky set text:本文` で登録（`title` を入れると埋め込み、`button_label`+`button_url` でリンクボタン）\n"
+              "② 誰かが投稿するたびに、古い案内を消して一番下に貼り直します\n"
+              "・`/sticky copy message_id:ID` で既存メッセージを流用 ・`/sticky remove` で解除 ・`/sticky list` で一覧",
+    "invite-stats": "招待リンクの作成（URL・有効期限・作成者の累計作成数）と、メンバー参加時の招待元（作成者・作成日時）を"
+                    "ログチャンネルに自動で記録します。認証ログにも招待元が表示されます。\n"
+                    "・`/invite-stats user:@ユーザー` で累計作成数と有効なリンクを確認\n"
+                    "※ Botに「サーバーの管理」権限が必要です",
     "setup": "認証で付与するロールと、認証ログを送るチャンネルを設定します。最初に実行してください。",
     "panel": "「認証する」ボタン付きのパネルを送ります。メンバーはボタンからDiscordでログインして認証します。",
     "subaccount": "同じIPから別アカウントが認証したとき「拒否」か「記録のみ」かを選べます。BAN・ブラックリスト対象と同じIPは常に拒否されます。",
@@ -62,16 +64,23 @@ class HelpCog(commands.Cog):
         e = discord.Embed(title=f"{cat} のコマンド", color=0x5865F2)
         for n in names:
             c = cmds.get(n)
-            if c is None:
+            if c is None or len(e.fields) >= 24:
                 continue
+            body = f"💡 {GUIDE[n]}\n" if n in GUIDE else ""
             if isinstance(c, app_commands.Group):
-                body = "\n".join(f"`/{s.qualified_name}` {s.description}" for s in c.walk_commands()
-                                 if isinstance(s, app_commands.Command))
+                body += "\n".join(f"`/{s.qualified_name}` {s.description}" for s in c.walk_commands()
+                                   if isinstance(s, app_commands.Command))
             else:
-                body = f"`{_usage(c)}`\n{c.description}"
-            if n in GUIDE:
-                body += f"\n💡 {GUIDE[n]}"
-            e.add_field(name=f"/{n}", value=body[:1024] or "-", inline=False)
+                body += f"`{_usage(c)}`\n{c.description}"
+            # 1項目1024文字の上限を超える場合は、行の区切りで分けて続きの項目にする
+            chunk, part = "", 0
+            for line in body.split("\n"):
+                if len(chunk) + len(line) + 1 > 1000:
+                    e.add_field(name=f"/{n}" + (" （続き）" if part else ""), value=chunk, inline=False)
+                    chunk, part = "", part + 1
+                chunk += line + "\n"
+            if chunk.strip():
+                e.add_field(name=f"/{n}" + (" （続き）" if part else ""), value=chunk, inline=False)
         e.set_footer(text="/help command:コマンド名 で、引数ごとの詳しい説明を表示します")
         return e
 
@@ -79,8 +88,11 @@ class HelpCog(commands.Cog):
         cmds = self._commands()
         known = {n for _, ns in CATEGORIES for n in ns}
         e = discord.Embed(title="📖 コマンド一覧と使い方", color=0x5865F2,
-                          description="下のメニューでカテゴリを選ぶと、使い方を詳しく表示します。\n"
-                                      "**はじめに:** `/setup` → `/panel` で認証を設置しましょう。")
+                          description="下のメニューでカテゴリを選ぶと、使い方を詳しく表示します。\n\n"
+                                      "**はじめに**\n"
+                                      "・認証の設置: `/setup` → `/panel`\n"
+                                      "・荒らし対策: `/nuke-defense` → `/set-log-channel`\n"
+                                      "・案内を一番下に固定: `/sticky set`")
         for cat, names in CATEGORIES:
             if cat == OWNER_CAT and not is_owner:
                 continue
