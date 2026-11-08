@@ -30,6 +30,7 @@ STATE_COOKIE = "dash_state"
 SESSION_TTL = 12 * 3600
 _sessions: dict[str, dict] = {}
 _states: dict[str, float] = {}
+_used_states: dict[str, float] = {}  # 同じログインの使い回し防止
 
 TABS = [("overview", "📊 概要"), ("health", "🩺 障害"), ("logs", "📜 Botログ"), ("auth", "🔐 認証ログ"),
         ("security", "🚨 Nuke/Raid"), ("gban", "🚫 GBAN"), ("license", "⏸️ ライセンス"),
@@ -94,6 +95,28 @@ def _secure_headers(resp: Response) -> Response:
     return resp
 
 
+def _sign_state(key: bytes) -> str:
+    import hashlib
+    import hmac
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(12)
+    sig = hmac.new(key, f"{ts}.{nonce}".encode(), hashlib.sha256).hexdigest()[:32]
+    return f"dash_{ts}.{nonce}.{sig}"
+
+
+def _check_state(key: bytes, state: str, max_age: int = 600) -> bool:
+    import hashlib
+    import hmac
+    try:
+        ts, nonce, sig = state.removeprefix("dash_").split(".", 2)
+        if time.time() - int(ts) > max_age:
+            return False
+        good = hmac.new(key, f"{ts}.{nonce}".encode(), hashlib.sha256).hexdigest()[:32]
+        return secrets.compare_digest(sig, good)
+    except (ValueError, TypeError):
+        return False
+
+
 def register(app, ctx):
     """ctx に必要なもの（main.py が用意）:
     bot, client_id, client_secret, base_url()（関数）, get_owner_ids(), limiter, client_ip(),
@@ -104,6 +127,10 @@ def register(app, ctx):
     def redirect_uri() -> str:
         # 認証で登録済みの /callback をそのまま使う（state が "dash_" で始まるものを main.py がこちらへ回す）
         return ctx.oauth_redirect_uri()
+
+    def state_key() -> bytes:
+        import hashlib
+        return hashlib.sha256(("dashboard-state:" + ctx.client_secret).encode()).digest()
 
     def cookie_secure() -> bool:
         return ctx.base_url().startswith("https://")
@@ -453,8 +480,7 @@ def register(app, ctx):
         now = time.time()
         for k in [k for k, v in _states.items() if now - v > 600]:
             _states.pop(k, None)
-        state = "dash_" + secrets.token_urlsafe(24)
-        _states[state] = now
+        state = _sign_state(state_key())
         params = httpx.QueryParams({"client_id": ctx.client_id, "redirect_uri": redirect_uri(),
                                     "response_type": "code", "scope": "identify", "state": state,
                                     "prompt": "none"})
@@ -474,10 +500,18 @@ def register(app, ctx):
     async def dashboard_callback(request: Request, code: str | None = None, state: str | None = None):
         """main.py の /callback から呼ばれる（state が dash_ で始まるとき）。"""
         cookie_state = request.cookies.get(STATE_COOKIE)
-        issued = _states.pop(state or "", None)
-        if (not code or not state or issued is None or time.time() - issued > 600
-                or not cookie_state or not secrets.compare_digest(cookie_state, state)):
-            return denied("ログインに失敗しました", "セッションが無効です。最初からやり直してください。", 400)
+        if not code or not state or not _check_state(state_key(), state):
+            return denied("ログインに失敗しました",
+                          "ログインの有効期限（10分）が切れたか、無効なリクエストです。最初からやり直してください。", 400)
+        if not cookie_state or not secrets.compare_digest(cookie_state, state):
+            return denied("ログインに失敗しました",
+                          "ブラウザのCookieを確認できませんでした。ログインを始めたのと同じブラウザで開き直してください"
+                          "（Discordアプリ内のブラウザでは失敗することがあります）。", 400)
+        if state in _used_states:
+            return denied("ログインに失敗しました", "このログインはすでに使われています。最初からやり直してください。", 400)
+        _used_states[state] = time.time()
+        for k in [k for k, v in _used_states.items() if time.time() - v > 900]:
+            _used_states.pop(k, None)
         async with httpx.AsyncClient(timeout=15) as http:
             r = await http.post("https://discord.com/api/v10/oauth2/token", data={
                 "client_id": ctx.client_id, "client_secret": ctx.client_secret,

@@ -1828,7 +1828,7 @@ class Health:
             await self.resolve(key, "正常に戻りました")
 
 
-health = Health()
+health_monitor = Health()  # ※ /health ページの関数 health() と名前がぶつからないようにする
 
 
 def note_http_5xx() -> None:
@@ -1886,38 +1886,38 @@ class HealthCog(commands.Cog):
         if not self.bot.is_ready() or self.bot.is_closed():
             self.offline_since = self.offline_since or now
             if now - self.offline_since > 300:
-                await health.report("Discord接続", 3, "Discordとの接続が5分以上切れています", auto=False,
+                await health_monitor.report("Discord接続", 3, "Discordとの接続が5分以上切れています", auto=False,
                                     state="manual_required", heal="自動再接続が5分以上成功していません")
             else:
-                await health.report("Discord接続", 2, "Discordとの接続が切れています", auto=True,
+                await health_monitor.report("Discord接続", 2, "Discordとの接続が切れています", auto=True,
                                     state="auto_healing", heal="自動で再接続中", notify=False)
             return
         if self.offline_since:
             self.offline_since = None
-            await health.ok("Discord接続")
+            await health_monitor.ok("Discord接続")
         # 2) Ping（遅延）
         lat = self.bot.latency
         if math.isfinite(lat) and lat * 1000 >= PING_WARN_MS:
-            await health.failed("Ping遅延", f"Pingが {round(lat * 1000)}ms です（基準 {PING_WARN_MS}ms）",
+            await health_monitor.failed("Ping遅延", f"Pingが {round(lat * 1000)}ms です（基準 {PING_WARN_MS}ms）",
                                 level=1, heal=None)
         else:
-            await health.ok("Ping遅延")
+            await health_monitor.ok("Ping遅延")
         # 3) Redis（GBAN・各種設定）
         if redis_client() is not None:
             try:
                 await asyncio.wait_for(redis_client().ping(), 5)
-                await health.ok("Redis")
+                await health_monitor.ok("Redis")
             except Exception as e:
-                await health.failed("Redis", f"Redisに接続できません（{type(e).__name__}）", level=2, heal=_heal_redis)
+                await health_monitor.failed("Redis", f"Redisに接続できません（{type(e).__name__}）", level=2, heal=_heal_redis)
         # 4) Discord API（OAuth2認証に使う）
         try:
             async with httpx.AsyncClient(timeout=8) as c:
                 r = await c.get("https://discord.com/api/v10/gateway")
             if r.status_code >= 500:
                 raise RuntimeError(f"HTTP {r.status_code}")
-            await health.ok("Discord API（OAuth2）")
+            await health_monitor.ok("Discord API（OAuth2）")
         except Exception as e:
-            await health.failed("Discord API（OAuth2）", f"Discord APIが応答しません（{type(e).__name__}）",
+            await health_monitor.failed("Discord API（OAuth2）", f"Discord APIが応答しません（{type(e).__name__}）",
                                 level=2, heal=_heal_caches)
         # 5) 認証ページ（このアプリ自身の /health）
         cog = self.bot.get_cog("StatusCog")
@@ -1928,18 +1928,18 @@ class HealthCog(commands.Cog):
                     r = await c.get(url)
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}")
-                await health.ok("認証API")
+                await health_monitor.ok("認証API")
             except Exception as e:
-                await health.failed("認証API", f"認証ページが応答しません（{type(e).__name__}）", level=2,
+                await health_monitor.failed("認証API", f"認証ページが応答しません（{type(e).__name__}）", level=2,
                                     heal=_heal_caches)
         # 6) 500エラーの多発
         while _http5xx and now - _http5xx[0] > 300:
             _http5xx.popleft()
         if len(_http5xx) >= 5:
-            await health.failed("Webエラー多発", f"5分間に {len(_http5xx)} 件のサーバーエラー（500）", level=2,
+            await health_monitor.failed("Webエラー多発", f"5分間に {len(_http5xx)} 件のサーバーエラー（500）", level=2,
                                 heal=_heal_caches)
         else:
-            await health.ok("Webエラー多発")
+            await health_monitor.ok("Webエラー多発")
         # 7) 追加機能（cog）のエラー → 3回以上なら読み込み直す
         for ext, dq in list(_cog_errors.items()):
             while dq and now - dq[0] > 600:
@@ -1951,9 +1951,9 @@ class HealthCog(commands.Cog):
                 async def reload(ext=ext):
                     await self.bot.reload_extension(ext)
                     return True
-                await health.failed(key, "コマンド実行中のエラーが続いています", level=1, heal=reload)
+                await health_monitor.failed(key, "コマンド実行中のエラーが続いています", level=1, heal=reload)
             elif not dq:
-                await health.ok(key)
+                await health_monitor.ok(key)
 
     @health_loop.before_loop
     async def _before(self):
@@ -2007,7 +2007,7 @@ class StatusCog(commands.Cog):
             color = 0xF59E0B   # 橙：認証APIだけ異常
         else:
             color = 0xEF4444   # 赤：Bot異常
-        overall, ocolor, code = health.overall()
+        overall, ocolor, code = health_monitor.overall()
         if code != "ok":
             color = ocolor  # 障害・復旧作業中の表示を優先する
 
@@ -2017,7 +2017,7 @@ class StatusCog(commands.Cog):
 
         embed = discord.Embed(title=STATUS_TITLE, color=color)
         embed.add_field(name="📢 現在の稼働状況", value=f"**{overall}**", inline=False)
-        active = sorted(health.data()["active"].values(), key=lambda i: -i["level"])
+        active = sorted(health_monitor.data()["active"].values(), key=lambda i: -i["level"])
         if active:  # 対象と種類だけを出す（エラー文・URL等の詳細は出さない）
             embed.add_field(name="⚠️ 発生中の障害", value="\n".join(
                 f"{LEVEL_LABEL[i['level']]}：{i['key']}（{STATE_LABEL[i['state']]}）" for i in active[:6]), inline=False)
@@ -3399,9 +3399,10 @@ _DIGITS = re.compile(r"^\d{15,21}$")
 QUERY_RULES: dict[str, dict[str, re.Pattern]] = {
     "/": {"guild": _DIGITS},
     "/login": {"guild": _DIGITS},
-    "/callback": {"code": re.compile(r"^[A-Za-z0-9]{1,128}$"), "state": re.compile(r"^[A-Za-z0-9_\-]{1,128}$"),
+    "/callback": {"code": re.compile(r"^[A-Za-z0-9]{1,128}$"), "state": re.compile(r"^[A-Za-z0-9_.\-]{1,128}$"),
                   "guild_id": _DIGITS, "error": re.compile(r"^[a-z_]{1,64}$"),
-                  "permissions": re.compile(r"^\d{1,25}$")},
+                  "permissions": re.compile(r"^\d{1,25}$"),
+                  "iss": re.compile(r"^https://discord(app)?\.com/?$")},  # Discordが付ける発行元（RFC 9207）
     "/dashboard": {"tab": re.compile(r"^[a-z]{1,20}$"), "sub": re.compile(r"^(hit|clear)?$")},
     "/dashboard/export": {"kind": re.compile(r"^(auth|incidents|logs)$")},
 }
@@ -4270,7 +4271,7 @@ dashboard_callback = None if dashboard is None else dashboard.register(app, Simp
     load_ip_index=load_ip_index, load_defense_config=load_defense_config, load_config=load_config,
     gban_list=gban_list, gban_add_all=gban_add_all, gban_del=gban_del,
     load_blocks=load_blocks, guard_unblock=guard_unblock, guard_web_strike=guard_web_strike,
-    health=health, level_label=LEVEL_LABEL, state_label=STATE_LABEL,
+    health=health_monitor, level_label=LEVEL_LABEL, state_label=STATE_LABEL,
     ip_retention_days=IP_RETENTION_DAYS,
 ))
 
