@@ -1,5 +1,5 @@
 """各種イベントログ。メッセージの削除・編集、メンバーの入退室、ボイスチャンネルの移動を
-指定チャンネルへEmbedで通知する。設定は Redis（eventlog:<guild_id> = チャンネルID）。
+指定チャンネルへEmbedで通知する。設定は Redis（eventlog:<guild_id> = チャンネルID / "0"=記録しない / 未設定=メインログへ）。
 
 ・メッセージの内容を表示するには MESSAGE CONTENT INTENT（ENABLE_MESSAGE_CONTENT_INTENT=1）が必要
 ・入退室の通知には SERVER MEMBERS INTENT（ENABLE_MEMBERS_INTENT=1）が必要
@@ -8,7 +8,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .common import FEATURE_UNAVAILABLE, is_admin, rdo, reply, safe_error, trim
+try:  # cogs/ フォルダの中に置いた場合
+    from .common import FEATURE_UNAVAILABLE, is_admin, rdo, reply, safe_error, trim
+except ImportError:  # main.py と同じ階層に置いた場合
+    from common import FEATURE_UNAVAILABLE, is_admin, rdo, reply, safe_error, trim
 
 
 def key(guild_id: int) -> str:
@@ -22,16 +25,28 @@ class EventLogs(commands.Cog):
 
     # --- 送信先 ---
     async def _channel_id(self, guild_id: int) -> int | None:
-        if guild_id in self._cache:
+        import time
+        stamp = self._stamp.get(guild_id, 0) if hasattr(self, "_stamp") else 0
+        if guild_id in self._cache and time.monotonic() - stamp < 60:
             return self._cache[guild_id]
+        if not hasattr(self, "_stamp"):
+            self._stamp = {}
+        self._stamp[guild_id] = time.monotonic()
         try:
             raw = await rdo("get", key(guild_id))
         except Exception as e:
             if not isinstance(e, RuntimeError):
                 print(f"イベントログ設定の取得エラー: {safe_error(e)}")
             return None  # 失敗時は保持しない
-        self._cache[guild_id] = int(raw) if raw and str(raw).isdigit() else None
-        return self._cache[guild_id]
+        if raw is not None and str(raw) == "0":
+            cid = None  # 「記録しない」に設定されている
+        elif raw and str(raw).isdigit():
+            cid = int(raw)
+        else:  # 個別の設定が無ければ、メインログへ
+            fn = getattr(self.bot, "main_log_channel_id", None)
+            cid = fn(guild_id) if fn else None
+        self._cache[guild_id] = cid
+        return cid
 
     async def send(self, guild: discord.Guild, embed: discord.Embed) -> None:
         cid = await self._channel_id(guild.id)
@@ -78,7 +93,7 @@ class EventLogs(commands.Cog):
             await reply(interaction, "管理者のみ実行できます。")
             return
         try:
-            await rdo("delete", key(interaction.guild.id))
+            await rdo("set", key(interaction.guild.id), "0")  # 「記録しない」（メインログにも送らない）
         except Exception as e:
             print(f"イベントログ設定の削除エラー: {safe_error(e)}")
             await reply(interaction, FEATURE_UNAVAILABLE)

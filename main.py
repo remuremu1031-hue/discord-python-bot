@@ -615,8 +615,8 @@ async def save_ticket_transcript(channel: discord.TextChannel, saved_by: discord
     for m in messages:
         participants.setdefault(m.author.id, m.author)
     result = "送信先チャンネルが未設定のため、あなたにだけ送りました（`/transcript-channel` で設定できます）。"
-    cid = get_transcript_channel_id(channel.guild.id)
-    dest = channel.guild.get_channel(cid) if cid else None
+    cid = get_transcript_channel_id(channel.guild.id) or get_main_log_channel_id(channel.guild.id)
+    dest = channel.guild.get_channel(cid) if cid else None  # 個別の送信先 → 無ければメインログ
     if isinstance(dest, discord.TextChannel) and dest.id != channel.id:
         embed = discord.Embed(title="📝 チケットのトランスクリプト", color=0x5865F2,
                               timestamp=datetime.now(timezone.utc))
@@ -687,7 +687,7 @@ KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
                  "nuke-whitelist", "subaccount", "transcript-channel", "help",
-                 "weather", "disaster", "sticky", "invite-stats", "invite-log", "invite-recount", "rank", "leaderboard", "level"}  # 残すスラッシュコマンド
+                 "weather", "disaster", "sticky", "invite-stats", "invite-log", "invite-recount", "main-log", "rank", "leaderboard", "level"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
@@ -798,6 +798,10 @@ class AuthBot(commands.Bot):
 
     def store_save(self, name: str, data: dict) -> None:
         storage.save(name, Path(f"{name}.json"), data)
+
+    def main_log_channel_id(self, guild_id: int) -> int | None:
+        """メインログのチャンネルID（cogs から使う）。"""
+        return get_main_log_channel_id(guild_id)
 
     def is_owner_id(self, user_id: int) -> bool:
         return user_id in (self._owner_ids or set())
@@ -2258,10 +2262,32 @@ async def set_log_channel_id(guild_id: int, channel_id: int) -> None:
     await _redis_do("set", f"config:log_channel:{guild_id}", str(channel_id))
 
 
+MAIN_LOG_FILE = Path("main_log_config.json")
+
+
+def get_main_log_channel_id(guild_id: int) -> int | None:
+    """メインログ（個別のログチャンネルが無いログを、まとめて送るチャンネル）。"""
+    v = storage.load("main_log_config", MAIN_LOG_FILE).get(str(guild_id))
+    return int(v) if v else None
+
+
+def set_main_log_channel_id(guild_id: int, channel_id: int | None) -> None:
+    data = storage.load("main_log_config", MAIN_LOG_FILE)
+    if channel_id:
+        data[str(guild_id)] = channel_id
+    else:
+        data.pop(str(guild_id), None)
+    storage.save("main_log_config", MAIN_LOG_FILE, data)
+
+
+async def del_log_channel_id(guild_id: int) -> None:
+    await _redis_do("delete", f"config:log_channel:{guild_id}")
+
+
 async def send_guild_log(guild: discord.Guild, embed: discord.Embed) -> bool:
-    """そのサーバーの、/set-log-channel で設定されたチャンネルへEmbedを送る。
-    未設定・権限なし・送信失敗のときは False（例外は外に出さない）。"""
-    cid = await get_log_channel_id(guild.id)
+    """セキュリティ・GBAN等のログ。/set-log-channel のチャンネルがあればそこだけへ、
+    無ければメインログへ送る。送れなかったときは False（例外は外に出さない）。"""
+    cid = await get_log_channel_id(guild.id) or get_main_log_channel_id(guild.id)
     if cid is None:
         return False
     ch = guild.get_channel(cid)
@@ -2875,6 +2901,25 @@ async def subaccount_cmd(interaction: discord.Interaction, action: str):
         f"・IPの記録は{IP_RETENTION_DAYS}日で自動削除されます\n"
         "※ 家族・学校・携帯回線などでIPを共有している場合も「該当」になることがあります。",
         ephemeral=True)
+
+
+@bot.tree.command(name="main-log", description="メインログ（個別に設定していないログをまとめて送るチャンネル）を設定します")
+@app_commands.describe(channel="メインログのチャンネル（省略すると解除）")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def main_log_cmd(interaction: discord.Interaction, channel: discord.TextChannel | None = None):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("「サーバーの管理」権限が必要です。", ephemeral=True)
+        return
+    if channel is not None and not _can_send(channel, interaction.guild):
+        await interaction.response.send_message(
+            f"{channel.mention} でBotに「チャンネルを見る・メッセージを送信・埋め込みリンク」の権限がありません。", ephemeral=True)
+        return
+    set_main_log_channel_id(interaction.guild.id, channel.id if channel else None)
+    await interaction.response.send_message(
+        (f"✅ メインログを {channel.mention} にしました。\n" if channel else "🔕 メインログを解除しました。\n")
+        + "個別にチャンネルを設定したログ（認証ログ・/set-log-channel・/transcript-channel・/invite-log・/eventlog）は"
+        "そのチャンネルだけに、設定していないログはメインログに送られます。", ephemeral=True)
 
 
 @bot.tree.command(name="transcript-channel",
@@ -4366,6 +4411,8 @@ guild_dashboard_callback = None if guild_dashboard is None else guild_dashboard.
     send_auth_panel=send_auth_panel, load_broadcast=load_broadcast, save_broadcast=save_broadcast,
     load_server_blacklist=load_server_blacklist, save_server_blacklist=save_server_blacklist,
     load_backups=load_backups, restore_backup=restore_backup,
+    get_main_log_channel_id=get_main_log_channel_id, set_main_log_channel_id=set_main_log_channel_id,
+    del_log_channel_id=del_log_channel_id,
 ))
 
 
@@ -4449,6 +4496,7 @@ if __name__ == "__main__":
                          ("subaccount_config", SUBACCOUNT_CONFIG_FILE),
                          ("security_blocks", SEC_BLOCK_FILE),
                          ("health_state", HEALTH_FILE),
+                         ("main_log_config", MAIN_LOG_FILE),
                          ("weather_config", Path("weather_config.json")),
                          ("invite_log_config", Path("invite_log_config.json")),
                          ("level_config", Path("level_config.json")),

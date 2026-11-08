@@ -217,8 +217,10 @@ class InviteTracker(commands.Cog):
         return f"{sec // 60}分"
 
     async def _log(self, guild: discord.Guild, embed: discord.Embed):
-        """送信先: /invite-log で指定したチャンネル → /set-log-channel のチャンネル の順。"""
+        """送信先: /invite-log で指定したチャンネル → メインログ → /set-log-channel のチャンネル の順。"""
         cid = self.bot.store_load("invite_log_config").get(str(guild.id))
+        if not cid and getattr(self.bot, "main_log_channel_id", None):
+            cid = self.bot.main_log_channel_id(guild.id)  # 個別の設定が無ければメインログへ
         ch = guild.get_channel(int(cid)) if cid else None
         if isinstance(ch, discord.TextChannel):
             try:
