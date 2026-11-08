@@ -22,7 +22,10 @@ from urllib.parse import parse_qs
 import discord
 import httpx
 from fastapi import Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from types import SimpleNamespace
+from urllib.parse import quote
+
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 API = "https://discord.com/api/v10"
 COOKIE = "gdash_session"
@@ -396,7 +399,18 @@ def register(app, ctx):
     # ================= 設定画面（タブ） =================
     TABS = [("modules", "🧩 モジュール"), ("auth", "🔐 認証"), ("logs", "📝 ログ・通知"), ("security", "🛡️ セキュリティ"),
             ("moderation", "🔨 モデレーション"), ("automod", "🧹 自動モデ・ログ"), ("tickets", "🎫 チケット"),
-            ("roles", "🎭 ロール"), ("sticky", "📌 案内の固定"), ("alerts", "🌦️ 天気・災害"), ("levels", "📈 レベル")]
+            ("roles", "🎭 ロール"), ("sticky", "📌 案内の固定"), ("alerts", "🌦️ 天気・災害"), ("levels", "📈 レベル"),
+            ("events", "🎉 イベント・投票"), ("tools", "🧰 便利ツール"), ("media", "📺 配信・VC")]
+    EXT_TABS = ("events", "tools", "media")
+    # extras.py（追加モジュール）の操作と必要な権限
+    EXT_NEED = {"x_ocr": "admin", "x_event": "manage_guild", "x_poll": "manage_guild", "x_poll_close": "manage_guild",
+                "x_event_delete": "manage_guild", "x_translate": "manage_guild", "x_automsg_add": "manage_guild",
+                "x_automsg_del": "manage_guild", "x_report": "manage_guild", "x_faq_add": "manage_guild",
+                "x_faq_del": "manage_guild", "x_faq_panel": "manage_guild", "x_faq_set": "manage_guild",
+                "x_threads": "manage_guild", "x_youtube_add": "manage_guild", "x_youtube_del": "manage_guild",
+                "x_say": "manage_guild", "x_vclink": "admin", "x_html": "admin"}
+    EXT_TOGGLE = {"ocr": "admin", "translate": "manage_guild", "automsg": "manage_guild", "report": "manage_guild",
+                  "faq": "manage_guild", "threads": "manage_guild", "youtube": "manage_guild", "vclink": "admin"}
 
     # ---- Redis（cogs が使うキーをそのまま読み書きする） ----
     async def kv_get(k):
@@ -516,6 +530,26 @@ def register(app, ctx):
         def opt(value, label, cur):
             return f'<option value="{_e(value)}"{" selected" if str(cur) == str(value) else ""}>{_e(label)}</option>'
 
+        def voice_options(current=None):
+            out = ['<option value="">（選択してください）</option>']
+            for ch in sorted(list(guild.voice_channels) + list(guild.stage_channels), key=lambda c: c.position):
+                cat = f"{ch.category.name} / " if ch.category else ""
+                out.append(f'<option value="{ch.id}"{" selected" if ch.id == current else ""}>🔊 {_e(cat + ch.name)}</option>')
+            return "".join(out)
+
+        def text_area(name, value, maxlen):
+            return f'<textarea name="{_e(name)}" maxlength="{int(maxlen)}" rows="4">{_e(value or "")}</textarea>'
+
+        H = SimpleNamespace(card=card, form=form, sel=sel, lbl=lbl, chk=chk, opt=opt, e=_e, voice_options=voice_options,
+                            text_area=text_area,
+                            channel_options=lambda cur, none_label="（選択してください）", voice=False: channel_options(
+                                guild, int(cur) if str(cur or "").isdigit() else None, none_label=none_label, voice=voice))
+        ext = b_cog("Extras")
+        xs = ext.module_states(gid) if ext is not None else {}
+
+        def xm(key):
+            return xs.get(key, (False, "（未導入）"))
+
         html_parts = []
         if tab == "modules":
             d = ctx.load_defense_config().get(str(gid), {})
@@ -543,6 +577,7 @@ def register(app, ctx):
                     ("inviteblock", "🔗", "招待リンクブロック", "他サーバーの招待リンクを自動でブロック", d.get("invite_block"), "both", "security", "admin", False),
                     ("spam", "🧹", "スパム対策", "連続投稿を自動削除して5分タイムアウト", am["spam"], "both", "automod", "admin", False),
                     ("amInvite", "✂️", "招待リンク削除", "招待リンクを含むメッセージを自動削除", am["invite"], "both", "automod", "admin", False),
+                    ("ocr", "🔍", "OCR画像検閲", "画像内の文字を読み取り、禁止ワードや招待リンクを検出" + xm("ocr")[1], xm("ocr")[0], "both", "security", "admin", False),
                 ]),
                 ("参加・認証", [
                     ("auth", "🔐", "Web認証", "Discordログインで認証し、ロールを自動付与", bool(cfg), None, "auth", "admin", True),
@@ -553,12 +588,18 @@ def register(app, ctx):
                     ("levels", "📈", "レベル・ランク", "メッセージとVCで経験値が貯まり、ランクロールを付与", lc.get("enabled", True) and bool(b_cog("Levels")), "both", "levels", "manage_guild", True),
                     ("roles", "🎭", "ロールメニュー", f"複数選択できるロールパネル（{rr_n}個）", rr_n > 0, None, "roles", "admin", False),
                     ("sticky", "📌", "案内の固定", f"案内を常にチャンネルの一番下に表示（{st_n}件）", st_n > 0, None, "sticky", "manage_messages", False),
+                    ("events", "🎉", "イベント", "候補日時の投票・予定の作成・参加者へのリマインド通知" + xm("events")[1], xm("events")[0], None, "events", "manage_guild", True),
+                    ("polls", "📊", "アンケート", "ボタンで投票、締め切りで自動集計" + xm("polls")[1], xm("polls")[0], None, "events", "manage_guild", False),
+                    ("faq", "❓", "FAQ", "よくある質問パネルと、キーワードへの自動回答" + xm("faq")[1], xm("faq")[0], "both", "tools", "manage_guild", False),
                 ]),
                 ("通知・配信", [
                     ("weather", "🗾", "天気予報", "全国の天気予報を指定時刻に自動投稿", bool(w), "off", "alerts", "manage_guild", False),
                     ("disaster", "🌊", "災害情報", "地震・津波・火山・気象警報を自動通知", bool(dz.get("channel") or dz.get("quake_channel")), "off", "alerts", "manage_guild", False),
                     ("eew", "🚨", "緊急地震速報", "予想最大震度5弱以上の警報を即時通知", bool(dz.get("eew_channel")), "off", "alerts", "manage_guild", False),
                     ("eventlog", "📋", "イベントログ", "削除・編集・入退室・VC移動を記録", ev_on, "off", "automod", "admin", False),
+                    ("youtube", "📺", "YouTube通知", "新着動画・配信をPush（WebSub）で即時通知" + xm("youtube")[1], xm("youtube")[0], "both", "media", "manage_guild", True),
+                    ("automsg", "⏰", "自動メッセージ", "指定した曜日・時刻にメッセージを自動投稿" + xm("automsg")[1], xm("automsg")[0], "both", "tools", "manage_guild", False),
+                    ("report", "📊", "週次レポート", "メッセージ数・参加/退出・よく話す人を毎週まとめて送信", xm("report")[0], "both", "tools", "manage_guild", False),
                 ]),
                 ("ログ", [
                     ("mainlog", "🗂️", "メインログ", (f"#{main_name} に、個別に設定していないすべてのログを送信" if main_name
@@ -570,6 +611,12 @@ def register(app, ctx):
                     ("moderation", "🔨", "モデレーション・警告", "タイムアウト・キック・BAN・警告の管理", True, None, "moderation", "moderate", False),
                     ("backup", "💾", "バックアップ", f"ロール・チャンネル構成の保存と復元（{bk_n}件）", bk_n > 0, None, "security", "admin", False),
                     ("logs", "📝", "個別のログ", "セキュリティ・トランスクリプト・招待ログを、メインログとは別のチャンネルへ", bool(inv_log) or bool(ctx.get_transcript_channel_id(gid)), None, "logs", "manage_guild", False),
+                    ("translate", "🌐", "翻訳", "国旗リアクションや指定チャンネルで自動翻訳（DeepL）" + xm("translate")[1], xm("translate")[0], "both", "tools", "manage_guild", False),
+                    ("threads", "🧵", "スレッド管理", "指定チャンネルの投稿に自動でスレッドを作成", xm("threads")[0], "both", "tools", "manage_guild", False),
+                    ("say", "📣", "代理送信", "テキスト・埋め込み・Webhookで、Botから送信（メンションは任意）", ext is not None, None, "tools", "manage_guild", False),
+                    ("vclink", "🎧", "VC連動公開", "VCに参加中の人だけに聞き専チャンネルを表示" + xm("vclink")[1], xm("vclink")[0], "both", "media", "admin", False),
+                    ("html", "📄", "チャンネルHTML保存", "チャンネルの会話をHTMLファイルとしてダウンロード", ext is not None, None, "media", "admin", False),
+                    ("recording", "🎙️", "録音", "VCの録音（Discord側の仕様により準備中）", False, None, "media", "admin", False),
                 ]),
             ]
             out = []
@@ -590,7 +637,7 @@ def register(app, ctx):
                         f'<div class="card mod{" wide" if wide else ""}"><div class="top"><div class="g" style="gap:12px">'
                         f'<div class="ic">{ic}</div><div class="name">{_e(name)}</div></div>{sw}</div>'
                         f'<div class="desc">{_e(desc)}</div><div class="foot">'
-                        f'<span class="badge{" on" if on else ""}">{"有効" if on else "無効"}</span>'
+                        f'<span class="badge{" on" if on else ""}">{"準備中" if key == "recording" else ("有効" if on else "無効")}</span>'
                         f'<a class="open" href="{href}">設定を開く ›</a></div></div>')
                 out.append(f'<div class="sec"><h3>{_e(gname)}</h3><div class="line"></div></div><div class="bento">{"".join(cards)}</div>')
             html_parts.append("".join(out))
@@ -653,6 +700,13 @@ def register(app, ctx):
                 + (form("backup_restore", lbl("復元するバックアップ") + sel("number", blist)
                         + '<div class="mut">足りないロール・チャンネルだけを作り直します（既存のものは変更しません）。</div>',
                         "このバックアップから復元", cls="btn danger", need="admin") if backups else ""), need="admin"))
+            if ext is not None:
+                html_parts.append(ext.ocr_card(gid, H))
+        elif tab in EXT_TABS:
+            if ext is None:
+                html_parts.append(card("🧩 追加モジュール", '<p class="mut">extras.py が読み込まれていません。ファイルを配置して再起動してください。</p>'))
+            else:
+                html_parts.append(await ext.render(tab, gid, guild, member, H))
         elif tab == "sticky":
             cog = ctx.bot.get_cog("Sticky")
             if cog is None:
@@ -855,7 +909,7 @@ def register(app, ctx):
         op = f.get("op", "")
         tab = f.get("tab") if f.get("tab") in dict(TABS) else "modules"
         perms = ctx_member_perms(member, guild)
-        need = OP_NEED.get(op)
+        need = OP_NEED.get(op) or EXT_NEED.get(op)
         if need is None:
             ctx.guard_web_strike(request, "invalid_input", f"不明な操作 {op[:20]}")
             return error(400, "保存できません", "不明な操作です。", sess)
@@ -863,7 +917,20 @@ def register(app, ctx):
             return forbidden(request, sess, f"{op} を権限なしで実行しようとした")
         gid = guild.id
         try:
-            done = await apply_op(op, f, guild, member, perms)
+            if op.startswith("x_"):
+                ext = b_cog("Extras")
+                if ext is None:
+                    raise ValueError("追加モジュール（extras.py）が読み込まれていません")
+                P = SimpleNamespace(pick_channel=lambda raw, required=False, voice=False: pick_channel(
+                    guild, raw, required=required, voice=voice))
+                done = await ext.dashboard_op(op, f, guild, member, P)
+                if isinstance(done, tuple) and done and done[0] == "file":  # HTML保存はその場でダウンロード
+                    _, fname, data = done
+                    return _headers(Response(data, media_type="text/html; charset=utf-8", headers={
+                        "Content-Disposition": f"attachment; filename=\"channel.html\"; filename*=UTF-8''{quote(fname)}",
+                        "Cache-Control": "no-store"}))
+            else:
+                done = await apply_op(op, f, guild, member, perms)
             ok = True
         except ValueError as e:
             done, ok = str(e), False
@@ -1133,6 +1200,15 @@ def register(app, ctx):
         # ---------- モジュール一覧のトグル ----------
         if op == "module_toggle":
             key, on = f.get("key", ""), f.get("to") == "1"
+            if key in EXT_TOGGLE:
+                if not perms[EXT_TOGGLE[key]]:
+                    raise ValueError("このモジュールを切り替える権限がありません")
+                ext = b_cog("Extras")
+                if ext is None:
+                    raise ValueError("追加モジュール（extras.py）が読み込まれていません")
+                names = {"ocr": "OCR画像検閲", "translate": "翻訳", "automsg": "自動メッセージ", "report": "週次レポート",
+                         "faq": "FAQ", "threads": "スレッド管理", "youtube": "YouTube通知", "vclink": "VC連動公開"}
+                return f"{names[key]} を{ext.toggle(gid, key, on)}にしました"
             need = {"nuke": "admin", "raid": "admin", "inviteblock": "admin", "spam": "admin", "amInvite": "admin",
                     "subaccount": "admin", "levels": "manage_guild", "weather": "manage_guild", "disaster": "manage_guild",
                     "eew": "manage_guild", "eventlog": "admin", "mainlog": "manage_guild"}.get(key)

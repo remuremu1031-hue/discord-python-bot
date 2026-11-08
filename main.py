@@ -687,12 +687,13 @@ KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
                  "nuke-whitelist", "subaccount", "transcript-channel", "help",
-                 "weather", "disaster", "sticky", "invite-stats", "invite-log", "invite-recount", "main-log", "rank", "leaderboard", "level"}  # 残すスラッシュコマンド
+                 "weather", "disaster", "sticky", "invite-stats", "invite-log", "invite-recount", "main-log", "rank", "leaderboard", "level",
+                 "translate", "poll", "event", "faq", "say", "export-channel"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
               "event_logs", "moderation", "automod",
-              "jma_alerts", "help", "sticky", "invite_tracker", "levels"]  # cogs/ フォルダの追加機能
+              "jma_alerts", "help", "sticky", "invite_tracker", "levels", "extras"]  # cogs/ フォルダの追加機能
 
 # ファイル名の別名（例: reaction_role.py でも reaction_roles として読み込む）
 COG_ALIASES = {"reaction_roles": ["reaction_role"], "event_logs": ["event_log"],
@@ -3133,6 +3134,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)  # /docs 等でAPI構成を公開しない
 
+# extras.py（追加モジュール）から使う共通部品
+bot.web_app = app
+bot.public_base_url = lambda: BASE_URL
+bot.build_transcript_html = (None if transcript is None else (lambda ch, msgs, member: transcript.build_html(
+    ch, msgs, saved_by=member, bot_name=bot.user.name if bot.user else "霊夢BOT")))
+
 
 # ---------- セキュリティ（レート制限・不正アクセスの通知） ----------
 def client_ip(request: Request) -> str:
@@ -3899,7 +3906,9 @@ TERMS_SECTIONS = [
                 "便利機能：チケットとその会話記録（トランスクリプト）の保存、ロールの選択メニュー・"
                 "リアクションによる付与、案内メッセージの固定表示、お知らせの配信",
                 "情報配信機能：気象庁の公開データに基づく天気予報の定時投稿、および地震・津波・火山・"
-                "気象警報などの災害情報の自動通知"]),
+                "気象警報などの災害情報の自動通知",
+                "追加モジュール：イベント・アンケート・FAQ・自動メッセージ・週次レポート・スレッド作成・"
+                "YouTubeの新着通知・代理送信・VC連動公開・チャンネルのHTML保存・翻訳・画像の文字検閲（OCR）"]),
         ("p", "本ボットの自動処理（自動処罰・自動復元・自動通知等）は、設定された条件に基づいて機械的に行われます。"
               "誤検知や処理の失敗が起こる場合があり、当方はその結果について責任を負いません。"),
         ("p", "天気予報および災害情報は参考情報であり、通知の遅延・欠落・誤りが生じる場合があります。"
@@ -3988,6 +3997,9 @@ PRIVACY_SECTIONS = [
               "取得した個人情報を第三者に提供することはありません。"),
         ("p", "なお、本ボットの運用のため、通信経路（Cloudflare等）やデータの保存先（Upstash等）の"
               "外部サービスを利用しており、これらのサービス上で情報が処理・保存されます。"),
+        ("p", "翻訳機能を使った場合はその文章を DeepL（DeepL SE）に、OCR画像検閲が有効なサーバーでは"
+              "投稿された画像を Google Cloud Vision（Google LLC）に送信して処理します。"
+              "これらは各サービスの規約に従って処理され、当方が画像そのものを保存することはありません。"),
     ]),
     ("6. データの管理", [
         ("p", "取得した情報は、不正アクセスや漏洩を防ぐために適切な管理を行います。"
@@ -4500,6 +4512,10 @@ if __name__ == "__main__":
                          ("weather_config", Path("weather_config.json")),
                          ("invite_log_config", Path("invite_log_config.json")),
                          ("level_config", Path("level_config.json")),
+                         ("extras_config", Path("extras_config.json")),
+                         ("extras_polls", Path("extras_polls.json")),
+                         ("extras_events", Path("extras_events.json")),
+                         ("extras_stats", Path("extras_stats.json")),
                          ("disaster_config", Path("disaster_config.json"))])
     except Exception as e:
         raise SystemExit("設定の読み込みに失敗しました（Upstashに接続できません）: "

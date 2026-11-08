@@ -12,6 +12,7 @@ CATEGORIES = [
     ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "main-log", "invite-log", "invite-stats", "invite-recount", "weather",
                     "disaster", "broadcast-channel", "help"]),
     ("📈 レベル・ランク", ["rank", "leaderboard", "level"]),
+    ("🧰 追加モジュール", ["event", "poll", "faq", "translate", "say", "export-channel"]),
     ("👑 オーナー専用", ["broadcast", "blacklist", "license", "gban"]),
 ]
 OWNER_CAT = "👑 オーナー専用"
