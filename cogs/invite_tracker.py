@@ -54,7 +54,8 @@ class kv:
 
     @classmethod
     async def set_json(cls, bot, key, value, ttl=None):
-        ok, _ = await cls._do(bot, "set", key, json.dumps(value, ensure_ascii=False), *(["ex", ttl] if ttl else []))
+        # redis-py の set(name, value, ex) は、3番目の引数が有効期限（秒）
+        ok, _ = await cls._do(bot, "set", key, json.dumps(value, ensure_ascii=False), *([int(ttl)] if ttl else []))
         if not ok:
             cls._mem[key] = value
             if ttl:
@@ -322,6 +323,49 @@ class InviteTracker(commands.Cog):
                           description=f"累計作成数: **{total}** 回（記録開始以降）\n有効なリンク: {len(active)} 件\n"
                                       + "\n".join(lines))
         await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+    @app_commands.command(name="invite-recount",
+                          description="招待リンクの累計作成数を、今ある招待リンクから数え直します（過去分はリセット）")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def invite_recount(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("「サーバーの管理」権限が必要です。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        snap = await self._refresh(guild)
+        if snap is None:
+            await interaction.followup.send("Botに「サーバーの管理」権限がないため、招待リンクを取得できません。")
+            return
+        removed = 0
+        if getattr(self.bot, "kv_ready", lambda: False)():
+            try:
+                for pattern in (f"invcount:{guild.id}:*", f"invmeta:{guild.id}:*"):
+                    cursor = 0
+                    while True:
+                        cursor, keys = await self.bot.kv("scan", cursor, pattern, 500)
+                        for k in keys:
+                            await self.bot.kv("delete", k)
+                            removed += 1
+                        if not cursor:
+                            break
+            except Exception as e:
+                await interaction.followup.send(f"Redisの操作に失敗しました（{type(e).__name__}）。")
+                return
+        for k in [k for k in kv._mem if k.startswith((f"invcount:{guild.id}:", f"invmeta:{guild.id}:"))]:
+            kv._mem.pop(k, None)
+        self._cache[guild.id] = snap
+        await self._seed(guild, snap)
+        counts: dict[int, int] = {}
+        for c, d in snap.items():
+            if c != "__vanity__" and d.get("inviter"):
+                counts[d["inviter"]] = counts.get(d["inviter"], 0) + 1
+        top = "\n".join(f"・<@{u}>: {n}回" for u, n in sorted(counts.items(), key=lambda x: -x[1])[:15])
+        await interaction.followup.send(
+            f"✅ 数え直しました（今ある招待リンク {sum(counts.values())} 件）。\n{top or '招待リンクはありません。'}",
+            allowed_mentions=discord.AllowedMentions.none())
 
 
 async def setup(bot: commands.Bot):

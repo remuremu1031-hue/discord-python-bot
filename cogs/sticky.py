@@ -46,7 +46,8 @@ class kv:
 
     @classmethod
     async def set_json(cls, bot, key, value, ttl=None):
-        ok, _ = await cls._do(bot, "set", key, json.dumps(value, ensure_ascii=False), *(["ex", ttl] if ttl else []))
+        # redis-py の set(name, value, ex) は、3番目の引数が有効期限（秒）
+        ok, _ = await cls._do(bot, "set", key, json.dumps(value, ensure_ascii=False), *([int(ttl)] if ttl else []))
         if not ok:
             cls._mem[key] = value
             if ttl:

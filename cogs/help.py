@@ -9,7 +9,7 @@ CATEGORIES = [
     ("🔐 認証", ["setup", "authlink", "panel", "subaccount", "server-blacklist"]),
     ("🛡️ セキュリティ", ["nuke-defense", "nuke-whitelist", "backup", "set-log-channel", "automod", "eventlog"]),
     ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "mass_role"]),
-    ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "invite-log", "invite-stats", "weather",
+    ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "invite-log", "invite-stats", "invite-recount", "weather",
                     "disaster", "broadcast-channel", "help"]),
     ("📈 レベル・ランク", ["rank", "leaderboard", "level"]),
     ("👑 オーナー専用", ["broadcast", "blacklist", "license", "gban"]),
@@ -27,6 +27,7 @@ GUIDE = {
               "・`/sticky copy message_id:ID` で既存メッセージを流用 ・`/sticky remove` で解除 ・`/sticky list` で一覧",
     "invite-log": "招待リンクの作成と、メンバー参加時の招待元（作成者・作成日時）のログを送るチャンネルを設定します。"
                   "未設定なら `/set-log-channel` のチャンネルに送ります。",
+    "invite-recount": "招待リンクの累計作成数を、今ある招待リンクから数え直します（過去分はリセットされます）。",
     "invite-stats": "招待リンクの作成（URL・有効期限・作成者の累計作成数）と、メンバー参加時の招待元（作成者・作成日時）を"
                     "ログチャンネルに自動で記録します。認証ログにも招待元が表示されます。\n"
                     "・`/invite-stats user:@ユーザー` で累計作成数と有効なリンクを確認\n"
