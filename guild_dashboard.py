@@ -294,7 +294,7 @@ def register(app, ctx):
             perms = int(g.get("permissions") or 0)
             if not (g.get("owner") or perms & PERM_ADMIN or perms & PERM_MANAGE_GUILD):
                 continue
-            icon = (f'<img src="https://cdn.discordapp.com/icons/{_e(g["id"])}/{_e(g["icon"])}.png?size=96" alt="">'
+            icon = (f'<img src="https://cdn.discordapp.com/icons/{_e(g["id"])}/{_e(g["icon"])}.png?size=128" alt="">'
                     if g.get("icon") else f'<div class="ph">{_e((g.get("name") or "?")[:1])}</div>')
             joined = ctx.bot.get_guild(int(g["id"])) is not None
             if joined:
@@ -358,7 +358,7 @@ def register(app, ctx):
             return (f'<label class="check{lockcls}"><input type="checkbox" name="{name}" value="1"'
                     f'{" checked" if val else ""}{lock}> {label}</label>')
         action = d.get("action", "ban")
-        icon = (f'<img src="{_e(guild.icon.replace(size=96).url)}" alt="">' if guild.icon
+        icon = (f'<img src="{_e(guild.icon.replace(size=128).url)}" alt="">' if guild.icon
                 else f'<div class="ph">{_e(guild.name[:1])}</div>')
         flash = f'<div class="flash{" ng" if is_ng else ""}">{_e(msg)}</div>' if msg else ""
         admin_note = "" if is_admin else (
