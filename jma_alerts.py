@@ -184,8 +184,9 @@ class JMAAlerts(commands.Cog):
                            mention_role="重大な情報（震度5弱以上・津波警報・特別警報・噴火警報）でメンションするロール")
     @app_commands.choices(
         min_intensity=[app_commands.Choice(name=f"震度{INT_LABEL.get(v, v)}以上", value=v) for v in INT_ORDER[:7]],
-        weather_level=[app_commands.Choice(name="特別警報のみ", value="special"),
-                       app_commands.Choice(name="警報・土砂災害・記録的大雨・竜巻も", value="warning"),
+        weather_level=[app_commands.Choice(name="特別警報・危険警報のみ", value="special"),
+                       app_commands.Choice(name="警報以上（土砂災害・記録的大雨・竜巻も）", value="warning"),
+                       app_commands.Choice(name="注意報以上（すべて）", value="advisory"),
                        app_commands.Choice(name="通知しない", value="off")])
     async def disaster_set(self, interaction: discord.Interaction, channel: discord.TextChannel,
                            min_intensity: str = "3", weather_level: str = "special",
@@ -201,7 +202,7 @@ class JMAAlerts(commands.Cog):
             f"✅ {channel.mention} に災害情報を通知します\n"
             + (f"・地震: <#{cur['quake_channel']}> に分離中（`/disaster quake` の設定）\n" if cur.get("quake_channel")
                else f"・地震: 震度{INT_LABEL.get(min_intensity, min_intensity)}以上（`/disaster quake` で別チャンネルに分離できます）\n")
-            + f"・津波・噴火: 常に通知\n・気象: {dict(special='特別警報のみ', warning='警報など', off='通知しない')[weather_level]}"
+            + f"・津波・噴火: 常に通知\n・気象: {dict(special='特別警報・危険警報のみ', warning='警報以上', advisory='注意報以上', off='通知しない')[weather_level]}"
             + (f"（地域: {area}）" if area else "") + "\n※ 緊急地震速報（EEW）は気象庁が一般公開していないため対象外です。",
             ephemeral=True)
 
@@ -313,35 +314,67 @@ class JMAAlerts(commands.Cog):
                     item = self._classify(kind, title, content, author)
                     if item is None:
                         continue
-                    sub, color, severe = item
+                    sub, color, severe, wlevel = item
                     e = discord.Embed(title=sub, description=content[:1500] or title, color=color)
                     e.set_author(name=author or "気象庁")
                     e.set_footer(text=f"出典：気象庁（{title}）")
                     out.append({"kind": sub.split()[0], "key": f"x:{eid}", "embed": e, "severe": severe,
-                                "text": text, "cat": "weather" if kind == "weather" else "eqvol"})
+                                "text": text, "cat": "weather" if kind == "weather" else "eqvol",
+                                "wlevel": wlevel})
             except Exception as ex:
                 print(f"気象庁XMLの取得に失敗 ({kind}): {type(ex).__name__}")
         return out
 
     @staticmethod
     def _classify(kind, title, content, author):
-        """通知する情報なら (表題, 色, 重大か) を返す。"""
+        """通知する情報なら (表題, 色, 重大か, 気象の段階) を返す。表題は発表内容の段階に合わせる。
+        気象の段階: 1=注意報 2=警報・警戒情報 3=危険警報 4=特別警報 0=解除"""
+        text = title + " " + content
         body = re.sub(r"^【[^】]*】", "", content)
         if kind == "eqvol":
-            if "津波" in title and any(w in title + content for w in ("大津波警報", "津波警報", "津波注意報")):
-                severe = "警報" in content.replace("注意報", "")
-                return ("🌊 津波情報", 0x1D4ED8 if not severe else 0xDC2626, severe)
+            if "津波" in title:
+                text = content or title  # 表題は「津波警報・注意報・予報」と全部入りなので、本文で判断する
+                if "解除" in text and "発表" not in text:
+                    return ("✅ 津波警報・注意報の解除", 0x22C55E, False, None)
+                if "大津波警報" in text:
+                    return ("🚨 大津波警報", 0x7E22CE, True, None)
+                if "津波警報" in text:
+                    return ("🌊 津波警報", 0xDC2626, True, None)
+                if "津波注意報" in text:
+                    return ("🟡 津波注意報", 0xEAB308, False, None)
+                return None  # 若干の海面変動などの予報のみ
             if "噴火" in title and "解説" not in title:
-                severe = "噴火速報" in title or "噴火警報" in content
-                return ("🌋 火山情報", 0xB45309, severe)
+                if "噴火速報" in title:
+                    return ("🌋 噴火速報", 0xB91C1C, True, None)
+                if "噴火警報" in text and "解除" not in body[:40]:
+                    return ("🌋 噴火警報", 0xDC2626, True, None)
+                return ("🌋 噴火予報・火山情報", 0xB45309, False, None)
             return None
-        tag = ("special" if ("特別警報" in title + content and "解除" not in body[:30]) else
-               "warning" if (title in ("記録的短時間大雨情報", "土砂災害警戒情報", "竜巻注意情報")
-                             or "危険警報" in body or "警報" in body.replace("注意報", "")) else None)
-        if tag == "special":
-            return ("🚨 特別警報", 0x7E22CE, True)
-        if tag == "warning":
-            return ("⚠️ 気象警報・情報", 0xEA580C, False)
+        # ---- 気象 ----
+        named = {"土砂災害警戒情報": ("🟥 土砂災害警戒情報", 0xDC2626, 2),
+                 "記録的短時間大雨情報": ("🟥 記録的短時間大雨情報", 0xDC2626, 2),
+                 "竜巻注意情報": ("🌪️ 竜巻注意情報", 0xEA580C, 2),
+                 "指定河川洪水予報": ("🌊 指定河川洪水予報", 0xEA580C, 2)}
+        for key, (label, color, lv) in named.items():
+            if key in title:
+                if "解除" in body[:40]:
+                    return (f"✅ {key}（解除）", 0x22C55E, False, 0)
+                return (label, color, False, lv)
+        if "警報" not in title and "注意報" not in title:
+            return None  # 府県気象情報などの解説は対象外
+        if "解除" in body and not any(w in body for w in ("発表", "警戒して", "注意して", "切り替え")):
+            return ("✅ 警報・注意報の解除", 0x22C55E, False, 0)
+        if "特別警報" in body and "解除" not in body[:40]:
+            return ("🚨 特別警報", 0x7E22CE, True, 4)
+        if "危険警報" in body:
+            return ("🟪 危険警報", 0xB91C1C, True, 3)
+        active = re.sub(r"[^、。]*警報を解除[^、。]*", "", body)  # 「○○警報を解除し…」の部分は数えない
+        if "警報" in active.replace("注意報", "") or "警戒してください" in active:
+            return ("⚠️ 警報", 0xDC2626, False, 2)
+        if "注意報" in body or "注意してください" in body:
+            return ("🟡 注意報", 0xEAB308, False, 1)
+        if "解除" in body:
+            return ("✅ 警報・注意報の解除", 0x22C55E, False, 0)
         return None
 
     @tasks.loop(seconds=45)
@@ -387,8 +420,15 @@ class JMAAlerts(commands.Cog):
         if not cfg.get("channel"):
             return False  # 地震だけを設定しているサーバー
         if item.get("cat") == "weather":
-            lv = cfg.get("weather", "special")
-            if lv == "off" or (lv == "special" and not item["severe"]):
+            # 設定した段階以上の情報だけを送る（解除は「警報」以下を選んでいるときに送る）
+            need = {"special": 3, "warning": 2, "advisory": 1}.get(cfg.get("weather", "special"))
+            wl = item.get("wlevel") or 0
+            if need is None:
+                return False
+            if wl == 0:
+                if need > 2:
+                    return False
+            elif wl < need:
                 return False
         area = cfg.get("area")
         return not area or item["severe"] and item.get("cat") == "eqvol" or area in item["text"]
