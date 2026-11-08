@@ -112,6 +112,7 @@ class InviteTracker(commands.Cog):
         self._cache: dict[int, dict[str, dict]] = {}  # サーバー → コード → {"uses","inviter","inviter_name","created","max_uses"}
         bot.get_join_invite = self.get_join_invite  # main.py から使う窓口
         bot.describe_invite = self.describe
+        bot.invite_tracking_since = self.tracking_since
 
     # ---------- 招待一覧のキャッシュ ----------
     @staticmethod
@@ -148,8 +149,15 @@ class InviteTracker(commands.Cog):
                 await self._seed(g, snap)
             await asyncio.sleep(0.5)
 
+    async def tracking_since(self, guild_id: int) -> float | None:
+        """このサーバーで招待の記録を始めた時刻（これより前の参加者は、招待元が分からない）。"""
+        v = await kv.get_json(self.bot, f"invstart:{guild_id}")
+        return float(v) if v else None
+
     async def _seed(self, guild: discord.Guild, snap: dict[str, dict]):
         """記録前から存在する招待リンクも、作成者の累計数に1回ずつ数える（初回のみ）。"""
+        if not await kv.get_json(self.bot, f"invstart:{guild.id}"):
+            await kv.set_json(self.bot, f"invstart:{guild.id}", time.time())
         for code, d in snap.items():
             if code == "__vanity__" or not d.get("inviter"):
                 continue
@@ -297,7 +305,12 @@ class InviteTracker(commands.Cog):
     def describe(info: dict | None) -> list[tuple[str, str]]:
         """認証ログ等に載せる (項目名, 内容) のリスト。"""
         if not info or not info.get("code"):
-            return [("招待リンク", "不明（OAuth2認証による参加・権限不足・同時参加などで特定できません）")]
+            why = (info or {}).get("missing")
+            text = {
+                "oauth": "なし（招待リンクを使わず、認証ページから直接サーバーに参加しました）",
+                "before": "記録なし（招待の記録を始める前から、サーバーに参加していたメンバーです）",
+            }.get(why, "特定できませんでした（同時に複数人が参加した・カスタム招待URL・Botの権限不足など）")
+            return [("招待リンク", text)]
         created = (datetime.fromtimestamp(info["created"], JST).strftime("%Y/%m/%d %H:%M")
                    if info.get("created") else "不明")
         who = (f"<@{info['inviter']}>（`{info.get('inviter_name')}` / `{info['inviter']}`）"

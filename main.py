@@ -3634,7 +3634,7 @@ async def send_auth_log(channel_id: int, user: dict, role: discord.Role | None,
                         age: timedelta, passed: bool, blacklisted: bool = False,
                         *, guild_id: int = 0, ipres: dict | None = None,
                         ip_tag: str | None = None, ip_masked: str | None = None,
-                        reason: str = ""):
+                        reason: str = "", joined_via_oauth: bool = False, joined_at=None):
     uid = int(user["id"])
     ipres = ipres or {"status": "unknown", "linked": [], "flags": []}
     sub_label = {"hit": "⚠️ 該当", "clear": "✅ 非該当"}.get(ipres["status"], "❔ 判定不可（IPを取得できません）")
@@ -3645,6 +3645,18 @@ async def send_auth_log(channel_id: int, user: dict, role: discord.Role | None,
             inv = await bot.get_join_invite(guild_id, uid)
         except Exception as e:
             print(f"招待情報の取得に失敗: {safe_error(e)}")
+    if not (inv and inv.get("code")):  # 招待元が無い理由を見分ける
+        why = None
+        if joined_via_oauth:
+            why = "oauth"
+        elif joined_at is not None and getattr(bot, "invite_tracking_since", None):
+            try:
+                since = await bot.invite_tracking_since(guild_id)
+                if since and joined_at.timestamp() < since:
+                    why = "before"
+            except Exception:
+                pass
+        inv = {**(inv or {}), "missing": why or (inv or {}).get("missing") or "unknown"}
     # ダッシュボード用に記録（チャンネルへ送れなくても残す）
     append_auth_log({"invite": inv,"t": int(time.time()), "guild": guild_id, "user": uid,
                      "name": user.get("username"), "passed": passed, "blacklisted": blacklisted,
@@ -4228,6 +4240,8 @@ async def callback(request: Request, code: str | None = None, state: str | None 
             except discord.NotFound:
                 member = None
 
+            joined_via_oauth = member is None  # 認証ページから直接サーバーに参加させた（招待リンクを使っていない）
+            joined_at = member.joined_at if member is not None else None
             if member is None:
                 # 未参加ならOAuth2経由でサーバーに参加させ、同時にロール付与
                 jr = await http.put(
@@ -4248,6 +4262,7 @@ async def callback(request: Request, code: str | None = None, state: str | None 
             try:
                 await send_auth_log(log_channel_id, user, role, age, True, guild_id=guild_id,
                                     ipres=ipres, ip_tag=h, ip_masked=masked,
+                                    joined_via_oauth=joined_via_oauth, joined_at=joined_at,
                                     reason="同一IPのアカウントあり（記録のみ）" if ipres["status"] == "hit" else "")
             except Exception as e:
                 print(f"認証ログ送信エラー: {safe_error(e)}")
