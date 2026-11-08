@@ -42,34 +42,94 @@ INVITE_PERMS = (0x2 | 0x4 | 0x10 | 0x20 | 0x80 | 0x400 | 0x800 | 0x2000 | 0x4000
                 | 0x10000000 | 0x20000000 | 0x10000000000)
 
 CSS = """
-*{box-sizing:border-box}body{margin:0;background:#0b0f19;color:#e5e7eb;
-font:15px/1.65 system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif}
-a{color:#93c5fd;text-decoration:none}
-header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;
-padding:12px 18px;background:#111827;border-bottom:1px solid #1f2937;position:sticky;top:0;z-index:5}
-header h1{margin:0;font-size:17px}header .me{display:flex;gap:10px;align-items:center;color:#9ca3af}
-header img{width:28px;height:28px;border-radius:50%}
-main{padding:18px;max-width:980px;margin:0 auto}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
-.card{background:#111827;border:1px solid #1f2937;border-radius:14px;padding:16px}
-.g{display:flex;gap:12px;align-items:center}
-.g img,.g .ph{width:48px;height:48px;border-radius:14px;background:#1f2937;display:flex;align-items:center;
-justify-content:center;font-weight:700;flex:none}
-.g .n{font-weight:700}.mut{color:#9ca3af;font-size:13px}
-.btn{display:inline-block;background:#5865f2;color:#fff;border:0;border-radius:10px;padding:9px 16px;
-font:inherit;cursor:pointer}.btn.ghost{background:#334155}.btn.danger{background:#dc2626}
-h2{font-size:17px;margin:22px 0 10px}
-label{display:block;margin:12px 0 4px;font-weight:600}
-select,input[type=text]{width:100%;background:#0f172a;color:#e5e7eb;border:1px solid #334155;border-radius:10px;
-padding:9px 11px;font:inherit}
-.check{display:flex;gap:8px;align-items:center;margin:8px 0;font-weight:400}
-.check input{width:18px;height:18px}
-.flash{padding:10px 14px;border-radius:10px;background:#1e293b;border:1px solid #334155;margin-bottom:14px}
-.flash.ng{border-color:#7f1d1d;background:#2a1215}
-.lock{opacity:.55}.tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;
-background:#1f2937;color:#9ca3af}.tag.ok{background:#14532d;color:#86efac}
-.hero{max-width:520px;margin:12vh auto;text-align:center}
-code{color:#c4b5fd}
+:root{--bg:#0a0b0d;--bg2:#101114;--card:#16171b;--card2:#1c1d22;--line:#26282e;--line2:#30333b;
+--text:#e8eaf0;--mut:#8b90a0;--blue:#3b82f6;--blue2:#2563eb;--blue-soft:rgba(59,130,246,.14);
+--ok:#22c55e;--ng:#ef4444;--warn:#f59e0b;--r:18px}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:radial-gradient(1200px 500px at 50% -200px,rgba(37,99,235,.18),transparent 70%),var(--bg);
+color:var(--text);font:15px/1.6 "Inter","Noto Sans JP","Hiragino Sans",system-ui,-apple-system,sans-serif;min-height:100vh}
+a{color:#7fb0ff;text-decoration:none}
+header{position:sticky;top:0;z-index:20;display:flex;justify-content:space-between;align-items:center;gap:10px;
+padding:12px 16px;background:rgba(10,11,13,.82);backdrop-filter:saturate(160%) blur(14px);
+-webkit-backdrop-filter:saturate(160%) blur(14px);border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:16px;font-weight:700;letter-spacing:.01em;display:flex;align-items:center;gap:8px;white-space:nowrap}
+header h1 .logo{width:28px;height:28px;border-radius:9px;background:linear-gradient(135deg,var(--blue),#1d4ed8);
+display:inline-flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 4px 14px rgba(37,99,235,.45)}
+header .me{display:flex;gap:8px;align-items:center;color:var(--mut);font-size:13px;min-width:0}
+header .me span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px}
+header img{width:30px;height:30px;border-radius:50%;border:1px solid var(--line2)}
+main{padding:18px 14px 60px;max-width:1120px;margin:0 auto}
+h2{font-size:16px;margin:0 0 10px;font-weight:700}
+.sec{display:flex;align-items:center;gap:10px;margin:26px 2px 12px}
+.sec h3{margin:0;font-size:13px;letter-spacing:.08em;color:var(--mut);font-weight:700}
+.sec .line{flex:1;height:1px;background:var(--line)}
+.card{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);border-radius:var(--r);
+padding:18px;box-shadow:0 1px 0 rgba(255,255,255,.03) inset,0 8px 24px rgba(0,0,0,.25)}
+.grid,.bento{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(270px,1fr))}
+.bento .wide{grid-column:span 2}
+@media (max-width:640px){.bento .wide{grid-column:span 1}main{padding:14px 10px 60px}.card{padding:15px}}
+.mod{display:flex;flex-direction:column;gap:10px;min-height:150px;transition:border-color .15s,transform .15s}
+.mod:hover{border-color:var(--line2);transform:translateY(-1px)}
+.mod .top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.mod .ic{width:42px;height:42px;border-radius:13px;background:var(--blue-soft);color:#93c5fd;display:flex;
+align-items:center;justify-content:center;font-size:21px;flex:none}
+.mod .name{font-weight:700;font-size:15px;margin-top:2px}
+.mod .desc{color:var(--mut);font-size:13px;line-height:1.55;flex:1}
+.mod .foot{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:2px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;
+background:#22252c;color:var(--mut);border:1px solid var(--line2)}
+.badge:before{content:"";width:7px;height:7px;border-radius:50%;background:#5b616e}
+.badge.on{background:rgba(59,130,246,.12);color:#93c5fd;border-color:rgba(59,130,246,.35)}
+.badge.on:before{background:var(--blue);box-shadow:0 0 8px var(--blue)}
+.open{font-size:13px;font-weight:600;color:#93c5fd;padding:6px 10px;border-radius:10px}
+.open:hover{background:var(--blue-soft)}
+.switch{position:relative;width:48px;height:28px;border-radius:999px;border:0;background:#2c2f37;cursor:pointer;
+flex:none;padding:0;transition:background .2s;box-shadow:inset 0 0 0 1px var(--line2)}
+.switch:after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#cfd3dc;
+transition:transform .2s,background .2s;box-shadow:0 2px 6px rgba(0,0,0,.4)}
+.switch.on{background:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.18)}
+.switch.on:after{transform:translateX(20px);background:#fff}
+.switch:disabled{opacity:.4;cursor:not-allowed}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;background:var(--blue);color:#fff;border:0;
+border-radius:12px;padding:10px 16px;font:inherit;font-weight:600;cursor:pointer;min-height:42px;
+box-shadow:0 6px 16px rgba(37,99,235,.28);transition:background .15s}
+.btn:hover{background:var(--blue2)}.btn:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
+.btn.ghost{background:#22252c;box-shadow:none;border:1px solid var(--line2);color:var(--text)}
+.btn.ghost:hover{background:#2a2d35}
+.btn.danger{background:#dc2626;box-shadow:0 6px 16px rgba(220,38,38,.25)}
+.tabs{display:flex;gap:8px;overflow-x:auto;padding:4px 2px 10px;margin:0 -2px 6px;scrollbar-width:none;
+-webkit-overflow-scrolling:touch;position:sticky;top:55px;z-index:10;background:linear-gradient(var(--bg) 70%,transparent)}
+.tabs::-webkit-scrollbar{display:none}
+.tabs a{flex:none;padding:8px 14px;border-radius:999px;background:var(--card);border:1px solid var(--line);
+color:var(--text);font-size:13px;font-weight:600;white-space:nowrap}
+.tabs a.on{background:var(--blue);border-color:var(--blue);color:#fff;box-shadow:0 4px 14px rgba(37,99,235,.35)}
+label{display:block;margin:14px 0 6px;font-weight:600;font-size:13px;color:#c9cdd6}
+select,input[type=text],textarea{width:100%;background:var(--bg2);color:var(--text);border:1px solid var(--line2);
+border-radius:12px;padding:11px 12px;font:inherit;font-size:15px;min-height:44px;outline:none}
+select:focus,input[type=text]:focus,textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(59,130,246,.2)}
+.check{display:flex;gap:12px;align-items:center;justify-content:space-between;margin:10px 0;padding:12px 14px;
+border-radius:12px;background:var(--bg2);border:1px solid var(--line);font-weight:500;color:var(--text)}
+.check input{appearance:none;-webkit-appearance:none;width:48px;height:28px;border-radius:999px;background:#2c2f37;
+position:relative;cursor:pointer;flex:none;order:2;margin:0;transition:background .2s;box-shadow:inset 0 0 0 1px var(--line2)}
+.check input:after{content:"";position:absolute;top:3px;left:3px;width:22px;height:22px;border-radius:50%;background:#cfd3dc;
+transition:transform .2s}
+.check input:checked{background:var(--blue)}.check input:checked:after{transform:translateX(20px);background:#fff}
+.flash{padding:12px 14px;border-radius:14px;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);
+margin-bottom:14px;font-size:14px}
+.flash.ng{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.35)}
+.lock{opacity:.6}
+.tag{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;background:#22252c;color:var(--mut)}
+.tag.ok{background:rgba(59,130,246,.15);color:#93c5fd}
+.g{display:flex;gap:12px;align-items:center;min-width:0}
+.g img,.g .ph{width:52px;height:52px;border-radius:16px;background:#22252c;display:flex;align-items:center;
+justify-content:center;font-weight:700;flex:none;border:1px solid var(--line2)}
+.g .n{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mut{color:var(--mut);font-size:13px}
+.hero{max-width:520px;margin:10vh auto;text-align:center;padding:30px 22px}
+.hero h2{font-size:22px}
+code{color:#a5c8ff;background:rgba(59,130,246,.1);padding:1px 6px;border-radius:6px;font-size:12px;word-break:break-all}
+.ghead{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:4px 0 14px}
+form{margin:0}
 """
 
 
@@ -126,8 +186,9 @@ def register(app, ctx):
                   f'</form></div>')
         doc = (f'<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" '
                f'content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>{TITLE}</title>'
-               f'<style>{CSS}</style></head><body><header><h1><a href="/guild-dashboard" style="color:inherit">'
-               f'🛡️ {TITLE}</a></h1>{me}</header><main>{body}</main></body></html>')
+               f'<style>{CSS}</style></head><body><header><h1><a href="/guild-dashboard" style="color:inherit;display:flex;'
+               f'align-items:center;gap:8px"><span class="logo">⛩️</span>{TITLE}</a></h1>{me}</header>'
+               f'<main>{body}</main></body></html>')
         return _headers(HTMLResponse(doc, status_code=status))
 
     def status_card() -> str:
@@ -275,7 +336,7 @@ def register(app, ctx):
 
     # ---------- サーバー一覧・設定画面 ----------
     @app.get("/guild-dashboard")
-    async def gd_home(request: Request, guild: str = "", msg: str = "", ng: str = "", tab: str = "auth", q: str = ""):
+    async def gd_home(request: Request, guild: str = "", msg: str = "", ng: str = "", tab: str = "modules", q: str = ""):
         sess = current(request)
         if sess is None:
             return page(status_card() + '<div class="card hero" style="margin-top:6vh"><h2>サーバー管理者向けダッシュボード</h2>'
@@ -311,13 +372,14 @@ def register(app, ctx):
             cards.append(f'<div class="card"><div class="g">{icon}<div><div class="n">{_e(g.get("name"))}</div>'
                          f'<div class="mut">{"導入済み" if joined else "未導入"}</div></div></div>'
                          f'<div style="margin-top:12px">{act}</div></div>')
-        body = (status_card() + '<h2>サーバーを選択</h2><p class="mut">「管理者」または「サーバー管理」権限を持つサーバーだけが表示されます。</p>'
+        body = (status_card() + '<div class="sec"><h3>サーバーを選択</h3><div class="line"></div></div>'
+                '<p class="mut" style="margin-top:-4px">「管理者」または「サーバー管理」権限を持つサーバーだけが表示されます。</p>'
                 + (f'<div class="grid">{"".join(cards)}</div>' if cards else
                    '<div class="card">管理できるサーバーがありません。</div>'))
         return page(body, sess)
 
     # ================= 設定画面（タブ） =================
-    TABS = [("auth", "🔐 認証"), ("logs", "📝 ログ・通知"), ("security", "🛡️ セキュリティ"),
+    TABS = [("modules", "🧩 モジュール"), ("auth", "🔐 認証"), ("logs", "📝 ログ・通知"), ("security", "🛡️ セキュリティ"),
             ("moderation", "🔨 モデレーション"), ("automod", "🧹 自動モデ・ログ"), ("tickets", "🎫 チケット"),
             ("roles", "🎭 ロール"), ("sticky", "📌 案内の固定"), ("alerts", "🌦️ 天気・災害"), ("levels", "📈 レベル")]
 
@@ -408,7 +470,7 @@ def register(app, ctx):
                 return error(403, "このサーバーでは利用できません", "このサーバーでは、霊夢BOTの機能が停止されています。", sess)
             return error(404, "Botが参加していません", "このサーバーには霊夢BOTが導入されていません。", sess)
         perms = ctx_member_perms(member, guild)
-        tab = tab if tab in dict(TABS) else "auth"
+        tab = tab if tab in dict(TABS) else "modules"
         gid = guild.id
 
         def form(op, inner, button, cls="btn", need="manage_guild", confirm=""):
@@ -440,7 +502,77 @@ def register(app, ctx):
             return f'<option value="{_e(value)}"{" selected" if str(cur) == str(value) else ""}>{_e(label)}</option>'
 
         html_parts = []
-        if tab == "auth":
+        if tab == "modules":
+            d = ctx.load_defense_config().get(str(gid), {})
+            am = {"spam": False, "invite": False, **(await kv_json(f"automod:{gid}") or {})}
+            lc = ctx.bot.store_load("level_config").get(str(gid), {})
+            w = ctx.bot.store_load("weather_config").get(str(gid))
+            dz = ctx.bot.store_load("disaster_config").get(str(gid), {})
+            cfg = ctx.load_config().get(str(gid))
+            ev = await kv_get(f"eventlog:{gid}")
+            tc = await kv_json(f"ticket:config:{gid}")
+            sticky = b_cog("Sticky")
+            st_n = len(await sticky._conf(gid)) if sticky else 0
+            rr = b_cog("ReactionRoles")
+            rr_n = len(await rr._get_menus(gid)) if rr else 0
+            bk_n = len(ctx.load_backups().get(str(gid), []))
+            inv_log = ctx.bot.store_load("invite_log_config").get(str(gid))
+            # (キー, アイコン, 名前, 説明, 有効か, トグル可否["both"/"off"/None], 詳細タブ, 必要な権限, 幅広)
+            groups = [
+                ("保護", [
+                    ("nuke", "🛡️", "Nuke対策", "大量削除・連続BANを検知し、実行者を自動処罰・被害を自動復元", d.get("nuke_defense"), "both", "security", "admin", True),
+                    ("raid", "🚧", "Raid対策", "短時間の大量参加を検知し、参加者のキックと認証レベルの引き上げ", d.get("raid_protection"), "both", "security", "admin", False),
+                    ("inviteblock", "🔗", "招待リンクブロック", "他サーバーの招待リンクを自動でブロック", d.get("invite_block"), "both", "security", "admin", False),
+                    ("spam", "🧹", "スパム対策", "連続投稿を自動削除して5分タイムアウト", am["spam"], "both", "automod", "admin", False),
+                    ("amInvite", "✂️", "招待リンク削除", "招待リンクを含むメッセージを自動削除", am["invite"], "both", "automod", "admin", False),
+                ]),
+                ("参加・認証", [
+                    ("auth", "🔐", "Web認証", "Discordログインで認証し、ロールを自動付与", bool(cfg), None, "auth", "admin", True),
+                    ("subaccount", "🕵️", "サブアカウント検知", "同じIPからの別アカウントの認証を拒否（オフで記録のみ）", ctx.get_subaccount_action(gid) == "block", "both", "auth", "admin", False),
+                    ("invites", "📨", "招待トラッキング", "誰の招待で参加したかを記録", bool(b_cog("InviteTracker")), None, "logs", "manage_guild", False),
+                ]),
+                ("エンゲージメント", [
+                    ("levels", "📈", "レベル・ランク", "メッセージとVCで経験値が貯まり、ランクロールを付与", lc.get("enabled", True) and bool(b_cog("Levels")), "both", "levels", "manage_guild", True),
+                    ("roles", "🎭", "ロールメニュー", f"複数選択できるロールパネル（{rr_n}個）", rr_n > 0, None, "roles", "admin", False),
+                    ("sticky", "📌", "案内の固定", f"案内を常にチャンネルの一番下に表示（{st_n}件）", st_n > 0, None, "sticky", "manage_messages", False),
+                ]),
+                ("通知・配信", [
+                    ("weather", "🗾", "天気予報", "全国の天気予報を指定時刻に自動投稿", bool(w), "off", "alerts", "manage_guild", False),
+                    ("disaster", "🌊", "災害情報", "地震・津波・火山・気象警報を自動通知", bool(dz.get("channel") or dz.get("quake_channel")), "off", "alerts", "manage_guild", False),
+                    ("eew", "🚨", "緊急地震速報", "予想最大震度5弱以上の警報を即時通知", bool(dz.get("eew_channel")), "off", "alerts", "manage_guild", False),
+                    ("eventlog", "📋", "イベントログ", "削除・編集・入退室・VC移動を記録", bool(ev), "off", "automod", "admin", False),
+                ]),
+                ("運営・管理", [
+                    ("tickets", "🎫", "チケット", "ボタンで問い合わせ用チャンネルを作成（トランスクリプト保存）", bool(tc), None, "tickets", "admin", True),
+                    ("moderation", "🔨", "モデレーション・警告", "タイムアウト・キック・BAN・警告の管理", True, None, "moderation", "moderate", False),
+                    ("backup", "💾", "バックアップ", f"ロール・チャンネル構成の保存と復元（{bk_n}件）", bk_n > 0, None, "security", "admin", False),
+                    ("logs", "📝", "ログ・通知先", "セキュリティログ・トランスクリプト・招待ログの送信先" + ("" if inv_log is None else ""), True, None, "logs", "manage_guild", False),
+                ]),
+            ]
+            out = []
+            for gname, mods in groups:
+                cards = []
+                for key, ic, name, desc, on, tog, link, need, wide in mods:
+                    sw = ""
+                    if tog == "both" or (tog == "off" and on):
+                        dis = "" if perms[need] else " disabled"
+                        sw = (f'<form method="post" action="/guild-dashboard/save"><input type="hidden" name="csrf" value="{_e(sess["csrf"])}">'
+                              f'<input type="hidden" name="guild" value="{gid}"><input type="hidden" name="tab" value="modules">'
+                              f'<input type="hidden" name="op" value="module_toggle"><input type="hidden" name="key" value="{key}">'
+                              f'<input type="hidden" name="to" value="{"0" if on else "1"}">'
+                              f'<button class="switch{" on" if on else ""}" title="{"無効にする" if on else "有効にする"}" '
+                              f'aria-label="{_e(name)}を{"無効" if on else "有効"}にする"{dis}></button></form>')
+                    href = f'/guild-dashboard?{httpx.QueryParams({"guild": str(gid), "tab": link})}'
+                    cards.append(
+                        f'<div class="card mod{" wide" if wide else ""}"><div class="top"><div class="g" style="gap:12px">'
+                        f'<div class="ic">{ic}</div><div class="name">{_e(name)}</div></div>{sw}</div>'
+                        f'<div class="desc">{_e(desc)}</div><div class="foot">'
+                        f'<span class="badge{" on" if on else ""}">{"有効" if on else "無効"}</span>'
+                        f'<a class="open" href="{href}">設定を開く ›</a></div></div>')
+                out.append(f'<div class="sec"><h3>{_e(gname)}</h3><div class="line"></div></div><div class="bento">{"".join(cards)}</div>')
+            html_parts.append("".join(out))
+        elif tab == "auth":
+
             cfg = ctx.load_config().get(str(gid)) or {}
             sub = ctx.get_subaccount_action(gid)
             html_parts.append(card("🔐 認証の設定（/setup・/subaccount）", form("auth_save",
@@ -644,14 +776,14 @@ def register(app, ctx):
                 lbl("チャンネル（VC含む）") + sel("channel", channel_options(guild, None, voice=True))
                 + lbl("操作") + sel("mode", opt("add", "追加", "add") + opt("remove", "削除", "")), "実行")))
 
-        nav = "".join(f'<a class="btn {"" if k == tab else "ghost"}" style="padding:6px 12px" '
+        nav = "".join(f'<a class="{"on" if k == tab else ""}" '
                       f'href="/guild-dashboard?{httpx.QueryParams({"guild": str(gid), "tab": k})}">{_e(v)}</a>' for k, v in TABS)
         icon = (f'<img src="{_e(guild.icon.replace(size=128).url)}" alt="">' if guild.icon else f'<div class="ph">{_e(guild.name[:1])}</div>')
         flash = f'<div class="flash{" ng" if is_ng else ""}">{_e(msg)}</div>' if msg else ""
         role_text = "管理者" if perms["admin"] else "サーバー管理"
         body = (status_card() + f'<div class="g" style="margin-bottom:12px">{icon}<div><div class="n" style="font-size:19px">{_e(guild.name)}</div>'
                 f'<div class="mut">あなたの権限: {role_text} ・ <a href="/guild-dashboard">サーバー一覧に戻る</a></div></div></div>'
-                f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">{nav}</div>{flash}' + "".join(html_parts)
+                f'<nav class="tabs">{nav}</nav>{flash}' + "".join(html_parts)
 )
         return page(body, sess)
 
@@ -663,7 +795,8 @@ def register(app, ctx):
                "level_save": "manage_guild", "level_role": "manage_guild", "level_noxp": "manage_guild",
                "ticket_setup": "admin", "ticket_panel": "admin", "mod_action": "admin", "warn_add": "moderate",
                "warn_clear": "admin", "automod_save": "admin", "eventlog_save": "admin", "rr_create": "admin",
-               "rr_edit": "admin", "rr_send": "admin", "rr_delete": "admin", "mass_role": "admin"}
+               "rr_edit": "admin", "rr_send": "admin", "rr_delete": "admin", "mass_role": "admin",
+               "module_toggle": "manage_guild"}
 
     @app.post("/guild-dashboard/save")
     @ctx.limiter.limit("30/minute")
@@ -682,7 +815,7 @@ def register(app, ctx):
         except LookupError:
             return error(404, "保存できません", "このサーバーでは設定を変更できません。", sess)
         op = f.get("op", "")
-        tab = f.get("tab") if f.get("tab") in dict(TABS) else "auth"
+        tab = f.get("tab") if f.get("tab") in dict(TABS) else "modules"
         perms = ctx_member_perms(member, guild)
         need = OP_NEED.get(op)
         if need is None:
@@ -955,6 +1088,73 @@ def register(app, ctx):
                 res = f"#{ch.name} を XP対象外から{'追加' if f.get('mode') == 'add' else '削除'}しました"
             b.store_save("level_config", data)
             return res
+        # ---------- モジュール一覧のトグル ----------
+        if op == "module_toggle":
+            key, on = f.get("key", ""), f.get("to") == "1"
+            need = {"nuke": "admin", "raid": "admin", "inviteblock": "admin", "spam": "admin", "amInvite": "admin",
+                    "subaccount": "admin", "levels": "manage_guild", "weather": "manage_guild", "disaster": "manage_guild",
+                    "eew": "manage_guild", "eventlog": "admin"}.get(key)
+            if need is None:
+                raise ValueError("このモジュールは切り替えられません")
+            if not perms[need]:
+                raise ValueError("このモジュールを切り替える権限がありません")
+            label = "有効" if on else "無効"
+            if key in ("nuke", "raid", "inviteblock"):
+                field = {"nuke": "nuke_defense", "raid": "raid_protection", "inviteblock": "invite_block"}[key]
+                dcfg = ctx.load_defense_config()
+                dd = dcfg.setdefault(str(gid), {})
+                dd[field] = on
+                ctx.save_defense_config(dcfg)
+                if key == "nuke" and on:
+                    try:
+                        ctx.take_backup(guild, auto=True)
+                    except Exception:
+                        pass
+                return f"{ {'nuke': 'Nuke対策', 'raid': 'Raid対策', 'inviteblock': '招待リンクブロック'}[key]} を{label}にしました"
+            if key in ("spam", "amInvite"):
+                cfg = {"spam": False, "invite": False, **(await kv_json(f"automod:{gid}") or {})}
+                cfg["spam" if key == "spam" else "invite"] = on
+                await kv_set_json(f"automod:{gid}", cfg)
+                cog = b_cog("AutoMod")
+                if cog is not None:
+                    import time as _t
+                    cog._cfg[gid] = (_t.monotonic(), cfg)
+                return f"{'スパム対策' if key == 'spam' else '招待リンク削除'} を{label}にしました"
+            if key == "subaccount":
+                ctx.set_subaccount_action(gid, "block" if on else "log")
+                return f"サブアカウント検知を{'拒否' if on else '記録のみ'}にしました"
+            if key == "levels":
+                data = b.store_load("level_config")
+                data.setdefault(str(gid), {})["enabled"] = on
+                b.store_save("level_config", data)
+                return f"レベル機能を{label}にしました"
+            if on:
+                raise ValueError("通知先のチャンネルを決める必要があります。「設定を開く」から設定してください")
+            if key == "weather":
+                data = b.store_load("weather_config")
+                data.pop(str(gid), None)
+                b.store_save("weather_config", data)
+                return "天気予報の自動投稿を停止しました"
+            if key in ("disaster", "eew"):
+                data = b.store_load("disaster_config")
+                cur = data.get(str(gid), {})
+                drop = ("channel", "min_int", "weather", "area", "role", "quake_channel", "quake_min_int", "quake_role") \
+                    if key == "disaster" else ("eew_channel", "eew_role")
+                for k in drop:
+                    cur.pop(k, None)
+                if cur:
+                    data[str(gid)] = cur
+                else:
+                    data.pop(str(gid), None)
+                b.store_save("disaster_config", data)
+                return f"{'災害情報' if key == 'disaster' else '緊急地震速報'}の通知を停止しました"
+            if key == "eventlog":
+                await b.kv("delete", f"eventlog:{gid}")
+                cog = b_cog("EventLogs")
+                if cog is not None:
+                    cog._cache[gid] = None
+                return "イベントログを停止しました"
+            raise ValueError("不明なモジュールです")
         # ---------- チケット ----------
         if op == "ticket_setup":
             role = pick_role(guild, member, f.get("role"), assignable=False, required=True)
