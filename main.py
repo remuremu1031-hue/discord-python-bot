@@ -544,6 +544,24 @@ class LicenseTree(app_commands.CommandTree):
     """ライセンス停止中のサーバーでは、すべてのスラッシュコマンドを使えなくする。
     （Botのオーナーは、ライセンスの管理のため対象外）"""
 
+    async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """コマンドのエラー。追加機能（cog）ごとに数え、続くようなら障害監視が読み込み直す。"""
+        if isinstance(error, app_commands.CheckFailure):
+            return
+        cmd = interaction.command
+        module = getattr(getattr(cmd, "callback", None), "__module__", "") or ""
+        if module and module != "__main__":
+            note_cog_error(module)
+        print(f"コマンドのエラー（/{getattr(cmd, 'qualified_name', '?')}）: {type(getattr(error, 'original', error)).__name__}")
+        try:
+            text = "❌ 処理中にエラーが発生しました。時間をおいて、もう一度お試しください。"
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         deny = guard_check_interaction(interaction)  # 自動防御（ブロック中・ブラックリスト・連打）
         if deny:
@@ -986,6 +1004,10 @@ class AuthBot(commands.Bot):
             await self.leave_blacklisted_guilds()  # 起動時：ブラックリストのサーバーから退出
         except Exception as e:
             print(f"ブラックリストのサーバーからの退出処理に失敗: {type(e).__name__}: {e}")
+        try:  # 障害の自動判定・自己修復
+            await self.add_cog(HealthCog(self))
+        except Exception as e:
+            print(f"障害監視の読み込みに失敗: {safe_error(e)}")
         if STATUS_CHANNEL_ID:  # 稼働状況の表示（Cog）を読み込む
             try:
                 await self.add_cog(StatusCog(self))
@@ -1649,6 +1671,302 @@ async def backup_cmd(interaction: discord.Interaction, action: str,
 STATUS_TITLE = "📡 霊夢BOT 稼働状況"
 
 
+# ---------- 障害の自動判定・自己修復（オートヒーリング） ----------
+# レベル 1=一部障害（監視・軽い自動対処） 2=障害（自動復旧を実行） 3=重要障害（自動では直せない・所有者の対応が必要）
+# 状態 monitoring=監視中 / auto_healing=自動復旧中 / manual_required=手動対応が必要 /
+#      manual_in_progress=所有者が手動対応中 / resolved=復旧済み
+HEALTH_FILE = Path("health_state.json")
+HEALTH_INTERVAL = int(os.getenv("HEALTH_INTERVAL_SECONDS", "30"))
+PING_WARN_MS = int(os.getenv("HEALTH_PING_WARN_MS", "250"))
+HEAL_MAX_RETRY = int(os.getenv("HEALTH_MAX_RETRY", "3"))  # この回数まで自動復旧を試し、だめなら重要障害へ
+LEVEL_LABEL = {1: "🟡 一部障害", 2: "🟠 障害", 3: "🔴 重要障害"}
+STATE_LABEL = {"monitoring": "監視中", "auto_healing": "自動復旧中", "manual_required": "手動対応が必要",
+               "manual_in_progress": "所有者が手動対応中", "resolved": "復旧済み"}
+_http5xx: deque = deque(maxlen=200)
+_cog_errors: dict[str, deque] = {}
+
+
+class Health:
+    """障害の記録・状態遷移・通知をまとめて扱う。"""
+
+    def __init__(self):
+        self.fails: dict[str, int] = {}
+
+    # --- 保存 ---
+    def data(self) -> dict:
+        d = storage.load("health_state", HEALTH_FILE)
+        d.setdefault("active", {})
+        d.setdefault("last_resolved", 0)
+        return d
+
+    def save(self, d: dict) -> None:
+        storage.save("health_state", HEALTH_FILE, d)
+
+    def overall(self) -> tuple[str, int, str]:
+        """(表示文, 色, 内部コード) … 稼働状況とダッシュボードの「現在のステータス」に使う。"""
+        d = self.data()
+        act = list(d["active"].values())
+        if any(i["state"] == "manual_in_progress" for i in act):
+            return "🔴 復旧作業中（所有者手動対応中・詳細確認中）", 0xEF4444, "manual"
+        if any(i["state"] == "manual_required" for i in act):
+            return "🔴 重要障害（所有者の対応待ち）", 0xEF4444, "critical"
+        if any(i["state"] == "auto_healing" for i in act):
+            return "🟠 復旧作業中（自動復旧実行中）", 0xF97316, "healing"
+        if act:
+            return "🟡 一部障害（監視中・自動対処済み）", 0xEAB308, "minor"
+        if time.time() - d.get("last_resolved", 0) < 1800:
+            return "🟢 正常（復旧完了）", 0x22C55E, "recovered"
+        return "🟢 正常", 0x22C55E, "ok"
+
+    # --- 発生・更新・解決 ---
+    async def report(self, key: str, level: int, cause: str, *, auto: bool, state: str,
+                     heal: str = "", notify: bool = True) -> None:
+        d = self.data()
+        cur = d["active"].get(key)
+        if cur and cur.get("state") == "manual_in_progress" and level <= cur["level"]:
+            return  # 所有者が対応中なら、自動判定で状態を上書きしない
+        changed = (cur is None or cur["level"] != level or cur["state"] != state)
+        now = int(time.time())
+        d["active"][key] = {"key": key, "level": level, "cause": cause[:300], "auto": auto, "state": state,
+                            "heal": heal[:300], "started": (cur or {}).get("started", now), "updated": now,
+                            "attempts": self.fails.get(key, 0)}
+        self.save(d)
+        if not changed:
+            return
+        print(f"🩺 {LEVEL_LABEL[level]}: {key} / {cause} / {STATE_LABEL[state]}")
+        record_incident({"type": "health", "kind": key, "level": level, "result":
+                         f"{LEVEL_LABEL[level]}（{STATE_LABEL[state]}）{cause}" + (f" / {heal}" if heal else "")})
+        if notify:
+            await self.notify(d["active"][key])
+        await self.refresh_status()
+
+    async def resolve(self, key: str, note: str = "自動で復旧しました", *, by_owner: bool = False) -> bool:
+        d = self.data()
+        inc = d["active"].pop(key, None)
+        self.fails.pop(key, None)
+        if inc is None:
+            return False
+        d["last_resolved"] = int(time.time())
+        self.save(d)
+        print(f"🩺 復旧: {key} / {note}")
+        record_incident({"type": "health", "kind": key, "level": inc["level"],
+                         "result": f"✅ 復旧完了（{note}）"})
+        e = discord.Embed(title="✅ 障害が復旧しました", color=0x22C55E, timestamp=datetime.now(timezone.utc))
+        e.add_field(name="対象", value=key, inline=True)
+        e.add_field(name="障害レベル", value=LEVEL_LABEL[inc["level"]], inline=True)
+        e.add_field(name="内容", value=note[:1000], inline=False)
+        e.add_field(name="継続時間", value=f"{(int(time.time()) - inc['started']) // 60}分", inline=True)
+        await dm_owners(e, dedupe=f"health-ok:{key}", cooldown=5)
+        await self.refresh_status()
+        return True
+
+    async def start_manual(self, key: str) -> bool:
+        """ダッシュボードの「復旧作業を開始する」ボタン。"""
+        d = self.data()
+        inc = d["active"].get(key)
+        if inc is None:
+            return False
+        inc["state"] = "manual_in_progress"
+        inc["updated"] = int(time.time())
+        self.save(d)
+        record_incident({"type": "health", "kind": key, "level": inc["level"],
+                         "result": "🛠️ 所有者が手動復旧作業を開始"})
+        await self.refresh_status()
+        return True
+
+    async def notify(self, inc: dict) -> None:
+        manual = inc["state"] in ("manual_required", "manual_in_progress")
+        color = {1: 0xEAB308, 2: 0xF97316, 3: 0xEF4444}[inc["level"]]
+        e = discord.Embed(title=f"{LEVEL_LABEL[inc['level']]}を検知しました", color=color,
+                          timestamp=datetime.now(timezone.utc))
+        e.add_field(name="障害レベル", value=LEVEL_LABEL[inc["level"]], inline=True)
+        e.add_field(name="状態", value=STATE_LABEL[inc["state"]], inline=True)
+        e.add_field(name="対象", value=inc["key"], inline=True)
+        e.add_field(name="原因", value=inc["cause"] or "-", inline=False)
+        e.add_field(name="自動復旧", value=inc["heal"] or ("実行中" if inc["state"] == "auto_healing" else "不要（監視のみ）"),
+                    inline=False)
+        e.add_field(name="所有者の手動対応", value="**必要**（ダッシュボードの「障害」タブから「復旧作業を開始する」）"
+                    if manual else "不要", inline=False)
+        await dm_owners(e, dedupe=f"health:{inc['key']}:{inc['level']}:{inc['state']}", cooldown=60)
+        if inc["level"] >= 3:
+            fire_and_forget(send_security_alert("重要障害", f"{inc['key']}: {inc['cause']}", None,
+                                                level="critical", dedupe_key=f"health:{inc['key']}"))
+
+    async def refresh_status(self) -> None:
+        """サポートサーバーの稼働状況を、すぐに更新する。"""
+        cog = bot.get_cog("StatusCog")
+        if cog is not None:
+            fire_and_forget(cog.refresh_now())
+
+    # --- 自己修復つきの判定 ---
+    async def failed(self, key: str, cause: str, *, level: int, heal) -> None:
+        """異常を1回検知。heal（自動修復の関数）を試し、上限を超えたら重要障害にする。"""
+        n = self.fails.get(key, 0) + 1
+        self.fails[key] = n
+        if heal is None:
+            await self.report(key, level, cause, auto=False, state="monitoring" if level == 1 else "manual_required")
+            return
+        if n > HEAL_MAX_RETRY:
+            await self.report(key, 3, f"{cause}（自動復旧を{HEAL_MAX_RETRY}回試しても直りません）", auto=False,
+                              state="manual_required", heal=f"自動復旧 {HEAL_MAX_RETRY} 回失敗")
+            return
+        await self.report(key, level, cause, auto=True, state="auto_healing" if level >= 2 else "monitoring",
+                          heal=f"自動復旧を実行中（{n}/{HEAL_MAX_RETRY}回目）")
+        try:
+            ok = await heal()
+        except Exception as e:
+            ok = False
+            print(f"自動復旧の処理でエラー（{key}）: {type(e).__name__}")
+        if ok:
+            await self.resolve(key, f"自動復旧に成功しました（{n}回目）")
+
+    async def ok(self, key: str) -> None:
+        """正常を確認。自動で直る種類の障害なら、ここで復旧扱いにする（所有者対応中のものは除く）。"""
+        self.fails.pop(key, None)
+        inc = self.data()["active"].get(key)
+        if inc and inc["state"] in ("monitoring", "auto_healing", "manual_required"):
+            await self.resolve(key, "正常に戻りました")
+
+
+health = Health()
+
+
+def note_http_5xx() -> None:
+    _http5xx.append(time.time())
+
+
+def note_cog_error(ext: str) -> None:
+    dq = _cog_errors.setdefault(ext, deque(maxlen=50))
+    dq.append(time.time())
+
+
+async def _heal_redis() -> bool:
+    """Redisの接続を作り直し、PINGで確認する。"""
+    global _redis
+    old = _redis
+    _redis = None
+    if old is not None:
+        try:
+            await old.aclose()
+        except Exception:
+            pass
+    r = redis_client()
+    if r is None:
+        return False
+    await asyncio.wait_for(r.ping(), 5)
+    return True
+
+
+async def _heal_caches() -> bool:
+    """軽い自動対処: 内部キャッシュを消して、次回の読み直しを促す。"""
+    global _suspended_cache
+    _suspended_cache = (0.0, frozenset())
+    _guard_inter.clear()
+    return True
+
+
+class HealthCog(commands.Cog):
+    """定期的に各部分を点検し、障害を判定・自己修復する。"""
+
+    def __init__(self, b: "AuthBot"):
+        self.bot = b
+        self.offline_since: float | None = None
+        self.health_loop.change_interval(seconds=HEALTH_INTERVAL)
+
+    async def cog_load(self):
+        self.health_loop.start()
+
+    async def cog_unload(self):
+        self.health_loop.cancel()
+
+    @tasks.loop(seconds=30)
+    async def health_loop(self):
+        now = time.time()
+        # 1) Discordとの接続（discord.py が自動で再接続する。5分戻らなければ重要障害）
+        if not self.bot.is_ready() or self.bot.is_closed():
+            self.offline_since = self.offline_since or now
+            if now - self.offline_since > 300:
+                await health.report("Discord接続", 3, "Discordとの接続が5分以上切れています", auto=False,
+                                    state="manual_required", heal="自動再接続が5分以上成功していません")
+            else:
+                await health.report("Discord接続", 2, "Discordとの接続が切れています", auto=True,
+                                    state="auto_healing", heal="自動で再接続中", notify=False)
+            return
+        if self.offline_since:
+            self.offline_since = None
+            await health.ok("Discord接続")
+        # 2) Ping（遅延）
+        lat = self.bot.latency
+        if math.isfinite(lat) and lat * 1000 >= PING_WARN_MS:
+            await health.failed("Ping遅延", f"Pingが {round(lat * 1000)}ms です（基準 {PING_WARN_MS}ms）",
+                                level=1, heal=None)
+        else:
+            await health.ok("Ping遅延")
+        # 3) Redis（GBAN・各種設定）
+        if redis_client() is not None:
+            try:
+                await asyncio.wait_for(redis_client().ping(), 5)
+                await health.ok("Redis")
+            except Exception as e:
+                await health.failed("Redis", f"Redisに接続できません（{type(e).__name__}）", level=2, heal=_heal_redis)
+        # 4) Discord API（OAuth2認証に使う）
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.get("https://discord.com/api/v10/gateway")
+            if r.status_code >= 500:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            await health.ok("Discord API（OAuth2）")
+        except Exception as e:
+            await health.failed("Discord API（OAuth2）", f"Discord APIが応答しません（{type(e).__name__}）",
+                                level=2, heal=_heal_caches)
+        # 5) 認証ページ（このアプリ自身の /health）
+        cog = self.bot.get_cog("StatusCog")
+        if cog is not None or BASE_URL:
+            url = (BASE_URL or f"http://localhost:{PORT}") + "/health"
+            try:
+                async with httpx.AsyncClient(timeout=8) as c:
+                    r = await c.get(url)
+                if r.status_code != 200:
+                    raise RuntimeError(f"HTTP {r.status_code}")
+                await health.ok("認証API")
+            except Exception as e:
+                await health.failed("認証API", f"認証ページが応答しません（{type(e).__name__}）", level=2,
+                                    heal=_heal_caches)
+        # 6) 500エラーの多発
+        while _http5xx and now - _http5xx[0] > 300:
+            _http5xx.popleft()
+        if len(_http5xx) >= 5:
+            await health.failed("Webエラー多発", f"5分間に {len(_http5xx)} 件のサーバーエラー（500）", level=2,
+                                heal=_heal_caches)
+        else:
+            await health.ok("Webエラー多発")
+        # 7) 追加機能（cog）のエラー → 3回以上なら読み込み直す
+        for ext, dq in list(_cog_errors.items()):
+            while dq and now - dq[0] > 600:
+                dq.popleft()
+            key = f"追加機能 {ext.removeprefix('cogs.')}"
+            if len(dq) >= 3:
+                dq.clear()
+
+                async def reload(ext=ext):
+                    await self.bot.reload_extension(ext)
+                    return True
+                await health.failed(key, "コマンド実行中のエラーが続いています", level=1, heal=reload)
+            elif not dq:
+                await health.ok(key)
+
+    @health_loop.before_loop
+    async def _before(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(20)
+
+    @health_loop.error
+    async def _loop_error(self, error):
+        print(f"障害監視の処理でエラー: {type(error).__name__}")
+        await asyncio.sleep(HEALTH_INTERVAL)
+        self.health_loop.restart()
+
+
 class StatusCog(commands.Cog):
     """サポートサーバー用：稼働状況のEmbedを、定期的に編集して表示する。
     表示するのは固定の項目だけ（認証API・Bot・Ping・導入サーバー数・最終更新）。
@@ -1689,12 +2007,20 @@ class StatusCog(commands.Cog):
             color = 0xF59E0B   # 橙：認証APIだけ異常
         else:
             color = 0xEF4444   # 赤：Bot異常
+        overall, ocolor, code = health.overall()
+        if code != "ok":
+            color = ocolor  # 障害・復旧作業中の表示を優先する
 
         api_text = "🔴 応答なし"
         if api_ok:
             api_text = "🟢 正常" + (f"（{api_ms} ms）" if api_ms is not None else "")
 
         embed = discord.Embed(title=STATUS_TITLE, color=color)
+        embed.add_field(name="📢 現在の稼働状況", value=f"**{overall}**", inline=False)
+        active = sorted(health.data()["active"].values(), key=lambda i: -i["level"])
+        if active:  # 対象と種類だけを出す（エラー文・URL等の詳細は出さない）
+            embed.add_field(name="⚠️ 発生中の障害", value="\n".join(
+                f"{LEVEL_LABEL[i['level']]}：{i['key']}（{STATE_LABEL[i['state']]}）" for i in active[:6]), inline=False)
         embed.add_field(name="🔐 認証API", value=api_text, inline=True)
         embed.add_field(name="🤖 Bot", value="🟢 オンライン" if bot_ok else "🔴 オフライン",
                         inline=True)
@@ -1703,7 +2029,7 @@ class StatusCog(commands.Cog):
                         inline=True)
         # 相対表示（◯分前）はDiscord側で計算されるので、更新が止まると古さが一目でわかる
         embed.add_field(name="🕒 最終更新", value=f"<t:{now}:F>（<t:{now}:R>）", inline=False)
-        embed.set_footer(text=f"{STATUS_INTERVAL_MINUTES}分ごとに自動更新")
+        embed.set_footer(text=f"{STATUS_INTERVAL_MINUTES}分ごと、および障害・復旧の発生時に自動更新")
         return embed
 
     # --- メッセージの取得・作成 ---
@@ -1727,6 +2053,17 @@ class StatusCog(commands.Cog):
         storage.save("status_message", STATUS_FILE,
                      {"channel_id": channel.id, "message_id": msg.id})
         return msg
+
+    async def refresh_now(self):
+        """障害・復旧の発生時やダッシュボードの操作時に、すぐ更新する（連続呼び出しは2秒にまとめる）。"""
+        if getattr(self, "_refreshing", False):
+            return
+        self._refreshing = True
+        try:
+            await asyncio.sleep(2)
+            await self.update_status_message()
+        finally:
+            self._refreshing = False
 
     # --- 定期更新 ---
     @tasks.loop(minutes=5)
@@ -3238,6 +3575,7 @@ async def unhandled_error_handler(request: Request, exc: Exception):
     """想定外のエラー。利用者には「エラーID」だけを見せ、詳細はサーバーのログにだけ残す。"""
     import traceback
     err_id = secrets.token_hex(4)
+    note_http_5xx()
     tb = traceback.extract_tb(exc.__traceback__)
     where = f"{Path(tb[-1].filename).name}:{tb[-1].lineno} ({tb[-1].name})" if tb else "-"
     print(f"[エラーID {err_id}] {request.method} {request.url.path} で {type(exc).__name__} が発生\n"
@@ -3932,6 +4270,7 @@ dashboard_callback = None if dashboard is None else dashboard.register(app, Simp
     load_ip_index=load_ip_index, load_defense_config=load_defense_config, load_config=load_config,
     gban_list=gban_list, gban_add_all=gban_add_all, gban_del=gban_del,
     load_blocks=load_blocks, guard_unblock=guard_unblock, guard_web_strike=guard_web_strike,
+    health=health, level_label=LEVEL_LABEL, state_label=STATE_LABEL,
     ip_retention_days=IP_RETENTION_DAYS,
 ))
 
@@ -4015,6 +4354,7 @@ if __name__ == "__main__":
                          ("security_incidents", INCIDENT_FILE), ("ticket_config", TICKET_CONFIG_FILE),
                          ("subaccount_config", SUBACCOUNT_CONFIG_FILE),
                          ("security_blocks", SEC_BLOCK_FILE),
+                         ("health_state", HEALTH_FILE),
                          ("weather_config", Path("weather_config.json")),
                          ("invite_log_config", Path("invite_log_config.json")),
                          ("level_config", Path("level_config.json")),

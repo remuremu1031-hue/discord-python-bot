@@ -31,7 +31,7 @@ SESSION_TTL = 12 * 3600
 _sessions: dict[str, dict] = {}
 _states: dict[str, float] = {}
 
-TABS = [("overview", "📊 概要"), ("logs", "📜 Botログ"), ("auth", "🔐 認証ログ"),
+TABS = [("overview", "📊 概要"), ("health", "🩺 障害"), ("logs", "📜 Botログ"), ("auth", "🔐 認証ログ"),
         ("security", "🚨 Nuke/Raid"), ("gban", "🚫 GBAN"), ("license", "⏸️ ライセンス"),
         ("blacklist", "⛔ ブラックリスト"), ("blocks", "🧱 自動ブロック"), ("guilds", "🏠 サーバー"),
         ("ips", "🌐 IP連携")]
@@ -128,8 +128,8 @@ def register(app, ctx):
         av = f'<img src="{_e(sess["avatar"])}" alt="">' if sess.get("avatar") else ""
         doc = f"""<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
-<title>管理ダッシュボード</title><style>{CSS}</style></head><body>
-<header><h1>🛡️ 認証Bot 管理ダッシュボード</h1><div class="me">{av}<span>{_e(sess["name"])}</span>
+<title>霊夢BOT 管理ダッシュボード</title><style>{CSS}</style></head><body>
+<header><h1>🛡️ 霊夢BOT 管理ダッシュボード</h1><div class="me">{av}<span>{_e(sess["name"])}</span>
 <form class="inline" method="post" action="/dashboard/logout"><input type="hidden" name="csrf" value="{_e(sess['csrf'])}">
 <button class="ghost">ログアウト</button></form></div></header>
 <nav>{nav}</nav><main>{f'<div class="flash">{_e(flash)}</div>' if flash else ""}{body}</main></body></html>"""
@@ -182,7 +182,9 @@ def register(app, ctx):
 
         def card(k, v, cls=""):
             return f'<div class="card"><div class="k">{_e(k)}</div><div class="v {cls}">{_e(v)}</div></div>'
+        st_text, _, st_code = ctx.health.overall()
         cards = "".join([
+            card("現在のステータス", st_text, {"ok": "ok", "recovered": "ok", "minor": "warn", "healing": "warn"}.get(st_code, "ng")),
             card("Bot", "オンライン" if ready else "オフライン", "ok" if ready else "ng"),
             card("Ping", ping),
             card("稼働時間", f"{up // 86400}日 {up % 86400 // 3600}時間 {up % 3600 // 60}分"),
@@ -266,7 +268,7 @@ def register(app, ctx):
         items = ctx.load_incidents()
         if q:
             items = [x for x in items if q.lower() in json.dumps(x, ensure_ascii=False).lower()]
-        cls = {"nuke": "t-ng", "raid": "t-ng", "abuse": "t-ng", "restore": "t-ok", "warning": "t-warn"}
+        cls = {"nuke": "t-ng", "raid": "t-ng", "abuse": "t-ng", "restore": "t-ok", "warning": "t-warn", "health": "t-warn"}
         rows = "".join(
             f"<tr><td>{_t(x.get('t'))}</td><td><span class='tag {cls.get(x.get('type'), 't-mut')}'>{_e(x.get('type'))}</span></td>"
             f"<td>{_e(x.get('guild_name'))}<br><code>{_e(x.get('guild'))}</code></td>"
@@ -391,7 +393,42 @@ def register(app, ctx):
                 '<th>ブロック日時</th><th></th></tr>'
                 + ("".join(rows) or "<tr><td colspan=7 class=mut>ブロック中の相手はいません</td></tr>") + "</table></div>")
 
-    TAB_FUNCS = {"blocks": tab_blocks, "overview": tab_overview, "logs": tab_logs, "security": tab_security,
+    async def tab_health(sess, q) -> str:
+        st_text, _, code = ctx.health.overall()
+        cls = {"ok": "ok", "recovered": "ok", "minor": "warn", "healing": "warn"}.get(code, "ng")
+        active = sorted(ctx.health.data()["active"].values(), key=lambda i: (-i["level"], i["started"]))
+        lvl_cls = {1: "t-warn", 2: "t-warn", 3: "t-ng"}
+        rows = []
+        for i in active:
+            healable = (f'<span class="tag t-ok">自己修復可能</span>' if i.get("auto")
+                        else f'<span class="tag t-ng">手動対応が必要</span>' if i["level"] >= 3 or i["state"] == "manual_required"
+                        else '<span class="tag t-mut">監視のみ</span>')
+            btns = ""
+            if i["state"] != "manual_in_progress":
+                btns += form(sess, "health_manual", hidden("key", i["key"]), "復旧作業を開始する",
+                             "danger" if i["level"] >= 3 else "ghost")
+            btns += " " + form(sess, "health_resolve", hidden("key", i["key"]), "復旧完了にする")
+            rows.append(
+                f"<tr><td><span class='tag {lvl_cls[i['level']]}'>{_e(ctx.level_label[i['level']])}</span></td>"
+                f"<td>{_e(i['key'])}</td><td>{_e(i['cause'])}</td><td>{healable}</td>"
+                f"<td>{_e(ctx.state_label[i['state']])}<br><span class='mut'>{_e(i.get('heal'))}</span></td>"
+                f"<td>{_t(i['started'])}<br><span class='mut'>更新 {_t(i['updated'])}</span></td><td>{btns}</td></tr>")
+        hist = [x for x in ctx.load_incidents() if x.get("type") == "health"]
+        hrows = "".join(
+            f"<tr><td>{_t(x.get('t'))}</td><td>{_e(ctx.level_label.get(x.get('level'), '-'))}</td>"
+            f"<td>{_e(x.get('kind'))}</td><td>{_e(x.get('result'))}</td></tr>" for x in reversed(hist[-100:]))
+        return (f'<div class="cards"><div class="card"><div class="k">現在のステータス</div>'
+                f'<div class="v {cls}">{_e(st_text)}</div></div></div>'
+                '<p class="mut">🟡 一部障害＝監視・軽い自動対処 ／ 🟠 障害＝自動復旧を実行 ／ 🔴 重要障害＝自動では直せず手動対応が必要。'
+                '「復旧作業を開始する」を押すと、サポートサーバーの稼働状況が「🔴 復旧作業中（所有者手動対応中）」に、'
+                '「復旧完了にする」で「🟢 正常（復旧完了）」に数秒で切り替わります。</p>'
+                '<h2>発生中の障害</h2><div class="wrap"><table><tr><th>レベル</th><th>対象</th><th>原因</th><th>自動で直せるか</th>'
+                '<th>状態・自動復旧</th><th>発生 / 更新</th><th>操作</th></tr>'
+                + ("".join(rows) or "<tr><td colspan=7 class=mut>発生中の障害はありません</td></tr>") + "</table></div>"
+                '<h2>障害の履歴</h2><div class="wrap"><table><tr><th>時刻</th><th>レベル</th><th>対象</th><th>内容</th></tr>'
+                + (hrows or "<tr><td colspan=4 class=mut>履歴はありません</td></tr>") + "</table></div>")
+
+    TAB_FUNCS = {"health": tab_health, "blocks": tab_blocks, "overview": tab_overview, "logs": tab_logs, "security": tab_security,
                  "gban": tab_gban, "license": tab_license, "blacklist": tab_blacklist,
                  "guilds": tab_guilds, "ips": tab_ips}
 
@@ -554,6 +591,15 @@ def register(app, ctx):
                         bl[kind] = [x for x in bl[kind] if x != tid]
                     ctx.save_blacklist(bl)
                     msg = f"{tid} を{'追加' if act == 'bl_add' else '削除'}しました。"
+            elif act in ("health_manual", "health_resolve"):
+                tab = "health"
+                key = (f.get("key") or "").strip()[:80]
+                if act == "health_manual":
+                    ok = await ctx.health.start_manual(key)
+                    msg = "手動復旧作業を開始しました（稼働状況は「🔴 復旧作業中」に切り替わります）。" if ok else "対象の障害が見つかりません。"
+                else:
+                    ok = await ctx.health.resolve(key, "所有者が復旧完了にしました", by_owner=True)
+                    msg = "復旧完了にしました（稼働状況は「🟢 正常（復旧完了）」に切り替わります）。" if ok else "対象の障害が見つかりません。"
             elif act == "unblock":
                 tab = "blocks"
                 kind = f.get("kind") if f.get("kind") in ("user", "ip") else None
