@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import json
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -58,11 +60,133 @@ class JMAAlerts(commands.Cog):
     async def cog_load(self):
         self.weather_loop.start()
         self.disaster_loop.start()
+        self._eew_task = asyncio.create_task(self._eew_listener())
 
     async def cog_unload(self):
         self.weather_loop.cancel()
         self.disaster_loop.cancel()
+        if getattr(self, "_eew_task", None):
+            self._eew_task.cancel()
         await self.http.aclose()
+
+    # ================= 緊急地震速報（P2P地震情報 API・WebSocket） =================
+    # 気象庁は緊急地震速報を一般にネット配信していないため、P2P地震情報（https://www.p2pquake.net/）が
+    # 中継する「緊急地震速報（警報）」を受信する。警報は予想最大震度5弱以上のときに発表される。
+    EEW_WS = os.getenv("EEW_WS_URL", "wss://api.p2pquake.net/v2/ws")
+    EEW_SCALE = {10: "1", 20: "2", 30: "3", 40: "4", 45: "5弱", 46: "5弱以上", 50: "5強", 55: "6弱",
+                 60: "6強", 70: "7", 99: "以上"}
+
+    def _scale(self, v) -> str:
+        try:
+            return self.EEW_SCALE.get(int(v), "不明")
+        except (TypeError, ValueError):
+            return "不明"
+
+    async def _eew_listener(self):
+        import aiohttp
+        await self.bot.wait_until_ready()
+        self._eew_seen: dict[str, int] = {}
+        self._eew_msgs: dict[str, dict[int, int]] = {}  # 地震ID → {チャンネルID: メッセージID}（続報で更新）
+        delay = 5
+        while True:
+            try:
+                async with aiohttp.ClientSession(headers=UA) as sess:
+                    async with sess.ws_connect(self.EEW_WS, heartbeat=30) as ws:
+                        print("緊急地震速報の受信を開始しました（P2P地震情報）")
+                        delay = 5
+                        async for msg in ws:
+                            if msg.type != aiohttp.WSMsgType.TEXT:
+                                if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                    break
+                                continue
+                            try:
+                                data = json.loads(msg.data)
+                            except ValueError:
+                                continue
+                            if isinstance(data, dict) and data.get("code") == 556:
+                                asyncio.create_task(self._on_eew(data))
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                print(f"緊急地震速報の接続が切れました（{type(e).__name__}）。{delay}秒後に再接続します")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
+
+    def _eew_embed(self, d: dict) -> discord.Embed:
+        eq = d.get("earthquake") or {}
+        hy = eq.get("hypocenter") or {}
+        areas = d.get("areas") or []
+        serial = (d.get("issue") or {}).get("serial") or "-"
+        if d.get("cancelled"):
+            e = discord.Embed(title="⚪ 緊急地震速報は取り消されました", color=0x6B7280,
+                              description="先ほどの緊急地震速報（警報）は取り消されました。")
+            e.set_footer(text="出典：気象庁（P2P地震情報 経由）")
+            return e
+        top = max((int(a.get("scaleTo") if a.get("scaleTo") not in (None, 99, -1) else a.get("scaleFrom") or 0)
+                   for a in areas), default=0)
+        e = discord.Embed(title="🚨 緊急地震速報（警報）", color=0xDC2626,
+                          description="**強い揺れに警戒してください。**\n"
+                                      "身の安全を確保し、丈夫な机の下などで揺れがおさまるのを待ってください。")
+        if d.get("test"):
+            e.title = "🧪 【訓練・テスト】緊急地震速報（警報）"
+        e.add_field(name="📍 震源", value=hy.get("name") or "調査中", inline=True)
+        e.add_field(name="🕒 発生時刻", value=(eq.get("originTime") or "-")[-8:-3] or "-", inline=True)
+        e.add_field(name="📈 予想最大震度", value=f"**{self._scale(top)}**" if top else "不明", inline=True)
+        mag = hy.get("magnitude")
+        e.add_field(name="📏 マグニチュード", value=f"M{mag}" if mag not in (None, -1) else "不明", inline=True)
+        depth = hy.get("depth")
+        e.add_field(name="⬇️ 深さ", value=("ごく浅い" if depth == 0 else f"約{depth}km") if depth not in (None, -1) else "不明",
+                    inline=True)
+        e.add_field(name="🔢 報数", value=f"第{serial}報", inline=True)
+        # 強い揺れが予想される地域（都道府県ごと）
+        by_pref: dict[str, list[str]] = {}
+        for a in sorted(areas, key=lambda a: -(a.get("scaleFrom") or 0)):
+            name = a.get("name") or ""
+            if a.get("kindCode") == "11":
+                name += "（到達済み）"
+            by_pref.setdefault(a.get("pref") or "その他", []).append(name)
+        for pref, names in list(by_pref.items())[:15]:
+            e.add_field(name=pref, value="、".join(names)[:1024], inline=False)
+        if not by_pref:
+            e.add_field(name="対象地域", value="発表なし", inline=False)
+        e.set_footer(text="出典：気象庁（P2P地震情報 経由）・予想は誤差を含みます")
+        e.timestamp = datetime.now(timezone.utc)
+        return e
+
+    async def _on_eew(self, d: dict):
+        eid = str((d.get("issue") or {}).get("eventId") or d.get("id") or "")
+        try:
+            serial = int((d.get("issue") or {}).get("serial") or 0)
+        except ValueError:
+            serial = 0
+        if d.get("test") and os.getenv("EEW_ALLOW_TEST") != "1":
+            return  # 試験配信は通知しない
+        if not eid or (self._eew_seen.get(eid, -1) >= serial and not d.get("cancelled")):
+            return  # 同じ報・古い報は送らない
+        self._eew_seen[eid] = serial
+        if len(self._eew_seen) > 200:
+            for k in list(self._eew_seen)[:100]:
+                self._eew_seen.pop(k, None)
+                self._eew_msgs.pop(k, None)
+        embed = self._eew_embed(d)
+        sent = self._eew_msgs.setdefault(eid, {})
+        for gid, cfg in self.bot.store_load("disaster_config").items():
+            cid = cfg.get("eew_channel")
+            if not cid or self._suspended(int(gid)):
+                continue
+            ch = self.bot.get_channel(int(cid))
+            if ch is None:
+                continue
+            try:
+                if cid in sent:  # 続報・取り消しは、最初のメッセージを書き換える
+                    await ch.get_partial_message(sent[cid]).edit(embed=embed)
+                else:
+                    role = cfg.get("eew_role")
+                    m = await ch.send(content=f"<@&{role}>" if role else None, embed=embed,
+                                      allowed_mentions=discord.AllowedMentions(roles=True))
+                    sent[cid] = m.id
+            except discord.HTTPException as e:
+                print(f"緊急地震速報の送信に失敗 ({gid}): {type(e).__name__}")
 
     def _suspended(self, gid: int) -> bool:
         return getattr(self.bot, "is_suspended", lambda _: False)(gid)
@@ -230,6 +354,41 @@ class JMAAlerts(commands.Cog):
             f"🌏 地震情報は {channel.mention} に通知します（震度{INT_LABEL.get(min_intensity, min_intensity)}以上）。\n"
             f"・津波・火山・気象警報の通知先: {other}", ephemeral=True)
 
+    @disaster.command(name="eew", description="緊急地震速報（警報）を通知するチャンネルを設定します")
+    @app_commands.describe(channel="緊急地震速報の通知先", mention_role="発表時にメンションするロール（任意）")
+    async def disaster_eew(self, interaction: discord.Interaction, channel: discord.TextChannel,
+                           mention_role: discord.Role | None = None):
+        p = channel.permissions_for(interaction.guild.me)
+        if not (p.send_messages and p.embed_links):
+            await interaction.response.send_message(
+                f"{channel.mention} でBotに「メッセージの送信・埋め込みリンク」権限が必要です。", ephemeral=True)
+            return
+        data = self.bot.store_load("disaster_config")
+        cur = data.setdefault(str(interaction.guild_id), {})
+        cur.update({"eew_channel": channel.id, "eew_role": mention_role.id if mention_role else None})
+        self.bot.store_save("disaster_config", data)
+        await interaction.response.send_message(
+            f"🚨 緊急地震速報（警報）を {channel.mention} に通知します"
+            + (f"（{mention_role.mention} をメンション）" if mention_role else "") + "。\n"
+            "・警報は予想最大震度5弱以上のときに発表されます（予報は対象外）\n"
+            "・続報や取り消しは、同じメッセージを書き換えて更新します\n"
+            "※ ネット経由のため、テレビ・スマホの速報より数秒〜十数秒遅れることがあります。"
+            "通知を待たずに、揺れを感じたらすぐ身を守ってください。",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    @disaster.command(name="eew-off", description="緊急地震速報の通知を止めます")
+    async def disaster_eew_off(self, interaction: discord.Interaction):
+        data = self.bot.store_load("disaster_config")
+        cur = data.get(str(interaction.guild_id), {})
+        cur.pop("eew_channel", None)
+        cur.pop("eew_role", None)
+        if cur:
+            data[str(interaction.guild_id)] = cur
+        else:
+            data.pop(str(interaction.guild_id), None)
+        self.bot.store_save("disaster_config", data)
+        await interaction.response.send_message("🔕 緊急地震速報の通知を止めました。", ephemeral=True)
+
     @disaster.command(name="quake-off", description="地震情報の分離をやめます（地震は通常の通知先に戻ります）")
     async def disaster_quake_off(self, interaction: discord.Interaction):
         data = self.bot.store_load("disaster_config")
@@ -288,14 +447,19 @@ class JMAAlerts(commands.Cog):
                     continue
                 key = f"q:{q.get('eid')}:{q.get('ttl')}"
                 mx = q["maxi"]
-                e = discord.Embed(title=f"🌏 地震情報（{q['ttl']}）・最大震度{INT_LABEL.get(mx, mx)}",
-                                  color=INT_COLOR.get(mx, 0x6B7280), url="https://www.jma.go.jp/bosai/map.html#contents=earthquake_map")
-                e.add_field(name="発生時刻", value=(q.get("at") or "-")[:16].replace("T", " "), inline=True)
-                e.add_field(name="震源", value=q.get("anm") or "調査中", inline=True)
-                e.add_field(name="規模", value=f"M{q['mag']}" if q.get("mag") else "-", inline=True)
-                e.set_footer(text="出典：気象庁")
-                out.append({"kind": "quake", "key": key, "embed": e, "int": mx, "text": q.get("anm", ""),
-                            "severe": _int_rank(mx) >= _int_rank("5-")})
+                item = {"kind": "quake", "key": key, "embed": None, "int": mx, "text": q.get("anm", ""),
+                        "severe": _int_rank(mx) >= _int_rank("5-")}
+                if self._bootstrapped and key not in self._seen:  # 新しい情報だけ、詳細を取りに行く
+                    detail = None
+                    if q.get("json"):
+                        try:
+                            dr = await self.http.get(f"https://www.jma.go.jp/bosai/quake/data/{q['json']}")
+                            dr.raise_for_status()
+                            detail = dr.json()
+                        except Exception as ex:
+                            print(f"地震の詳細の取得に失敗: {type(ex).__name__}")
+                    item["embed"] = self._quake_embed(q, detail)
+                out.append(item)
         except Exception as ex:
             print(f"地震情報の取得に失敗: {type(ex).__name__}")
         for url, kind in (("https://www.data.jma.go.jp/developer/xml/feed/eqvol.xml", "eqvol"),
@@ -324,6 +488,72 @@ class JMAAlerts(commands.Cog):
             except Exception as ex:
                 print(f"気象庁XMLの取得に失敗 ({kind}): {type(ex).__name__}")
         return out
+
+    @staticmethod
+    def _as_list(v) -> list:
+        return v if isinstance(v, list) else ([v] if v else [])
+
+    @classmethod
+    def _quake_embed(cls, q: dict, detail: dict | None) -> discord.Embed:
+        """地震情報の埋め込み: 発生時刻・震源地・深さ・規模・最大震度・津波・震度3以上の地域。"""
+        mx = q["maxi"]
+        e = discord.Embed(title=f"🌏 {q['ttl']}・最大震度{INT_LABEL.get(mx, mx)}",
+                          color=INT_COLOR.get(mx, 0x6B7280),
+                          url="https://www.jma.go.jp/bosai/map.html#contents=earthquake_map")
+        body = (detail or {}).get("Body", {}) or {}
+        eq = body.get("Earthquake", {}) or {}
+        # 深さは座標「+38.3+142.4-10000/」の最後（メートル・下向きがマイナス）
+        cod = q.get("cod") or ""
+        m = re.match(r"^([+-][\d.]+)([+-][\d.]+)([+-]\d+)?/?$", cod)
+        if m and m.group(3) is not None:
+            km = abs(int(m.group(3))) // 1000
+            depth = "ごく浅い" if km == 0 else f"約{km}km"
+        elif q["ttl"] == "震度速報":
+            depth = "調査中"
+        else:
+            depth = "不明"
+        e.add_field(name="🕒 発生時刻", value=(q.get("at") or "-")[:16].replace("T", " "), inline=True)
+        e.add_field(name="📍 震源地", value=q.get("anm") or ((eq.get("Hypocenter") or {}).get("Area") or {}).get("Name") or "調査中", inline=True)
+        e.add_field(name="⬇️ 深さ", value=depth, inline=True)
+        e.add_field(name="📏 マグニチュード", value=f"M{q['mag']}" if q.get("mag") not in (None, "", "Ｍ不明") else "調査中", inline=True)
+        e.add_field(name="📈 最大震度", value=f"**{INT_LABEL.get(mx, mx)}**", inline=True)
+        # 津波
+        comments = body.get("Comments", {}) or {}
+        texts = [c.get("Text", "") for c in cls._as_list(comments.get("ForecastComment")) if isinstance(c, dict)]
+        tsunami = " ".join(t for t in texts if t) or ("今後の情報に注意してください" if q["ttl"] == "震度速報" else "情報なし")
+        e.add_field(name="🌊 津波", value=tsunami[:1024], inline=False)
+        # 震度3以上の地域（震度ごとにまとめる。震源・震度情報は市町村名も付ける）
+        groups: dict[str, list[str]] = {}
+        obs = ((body.get("Intensity") or {}).get("Observation") or {})
+        for pref in cls._as_list(obs.get("Pref")):
+            for area in cls._as_list(pref.get("Area")):
+                amax = area.get("MaxInt")
+                if _int_rank(amax) < _int_rank("3"):
+                    continue
+                for city in cls._as_list(area.get("City")):
+                    cmax = city.get("MaxInt")
+                    if _int_rank(cmax) >= _int_rank("3"):
+                        groups.setdefault(cmax, []).append(city.get("Name", ""))
+                if not area.get("City"):  # 震度速報は地域単位
+                    groups.setdefault(amax, []).append(area.get("Name", ""))
+        for lv in sorted(groups, key=_int_rank, reverse=True):
+            names = [n for n in dict.fromkeys(groups[lv]) if n]
+            text, shown = "", 0
+            for n in names:
+                if len(text) + len(n) + 1 > 950:
+                    break
+                text += ("、" if text else "") + n
+                shown += 1
+            if shown < len(names):
+                text += f" ほか{len(names) - shown}か所"
+            e.add_field(name=f"震度{INT_LABEL.get(lv, lv)}", value=text or "-", inline=False)
+            if len(e.fields) >= 24:
+                break
+        if not groups:
+            e.add_field(name="震度3以上の地域", value="なし" if detail else "取得できませんでした（気象庁のページで確認してください）",
+                        inline=False)
+        e.set_footer(text="出典：気象庁")
+        return e
 
     @staticmethod
     def _classify(kind, title, content, author):
@@ -391,6 +621,8 @@ class JMAAlerts(commands.Cog):
             self._bootstrapped = True
             return
         for item in reversed(new):
+            if item.get("embed") is None:
+                continue
             for gid, cfg in configs.items():
                 if self._suspended(int(gid)) or not self._wants(cfg, item):
                     continue
