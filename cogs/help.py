@@ -106,7 +106,8 @@ class HelpCog(commands.Cog):
                                       "・認証の設置: `/setup` → `/panel`\n"
                                       "・荒らし対策: `/nuke-defense` → `/set-log-channel`\n"
                                       "・案内を一番下に固定: `/sticky set`\n"
-                                      "・レベル・ランク: `/rank` ／ 設定は `/level`")
+                                      "・レベル・ランク: `/rank` ／ 設定は `/level`\n"
+                                      "・Webでまとめて設定: 認証ページのURLの `/guild-dashboard`")
         for cat, names in CATEGORIES:
             if cat == OWNER_CAT and not is_owner:
                 continue

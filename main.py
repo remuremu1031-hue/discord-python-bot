@@ -55,7 +55,8 @@ def _import_optional(name: str):
 
 
 dashboard = _import_optional("dashboard")  # 所有者専用Webダッシュボード（dashboard.py）
-transcript = _import_optional("transcript")  # チケットのトランスクリプト生成（transcript.py）
+transcript = _import_optional("transcript")
+guild_dashboard = _import_optional("guild_dashboard")  # サーバー管理者向けダッシュボード（guild_dashboard.py）  # チケットのトランスクリプト生成（transcript.py）
 
 
 # ---------- Botのログをメモリにも残す（ダッシュボードで閲覧するため） ----------
@@ -3392,7 +3393,8 @@ TOOL_UA = re.compile(
     r"scrapy|headlesschrome|phantomjs|axios/|node-fetch|postmanruntime|insomnia)", re.I)
 _BROWSER_AUTO_PATHS = re.compile(
     r"^/(favicon\.ico|robots\.txt|sitemap\.xml|apple-touch-icon[\w-]*\.png|\.well-known/.*|manifest\.json)$")
-SENSITIVE_PATHS = ("/login", "/callback", "/dashboard/login", "/dashboard/action", "/dashboard/logout")
+SENSITIVE_PATHS = ("/login", "/callback", "/dashboard/login", "/dashboard/action", "/dashboard/logout",
+                   "/guild-dashboard/login", "/guild-dashboard/save", "/guild-dashboard/logout")
 ALLOWED_METHODS = {"GET", "HEAD", "POST"}
 # エンドポイントごとの、許可するクエリパラメータと形式（ここに無いパラメータは無視されるが、長さは制限）
 _DIGITS = re.compile(r"^\d{15,21}$")
@@ -3405,17 +3407,19 @@ QUERY_RULES: dict[str, dict[str, re.Pattern]] = {
                   "iss": re.compile(r"^https://discord(app)?\.com/?$")},  # Discordが付ける発行元（RFC 9207）
     "/dashboard": {"tab": re.compile(r"^[a-z]{1,20}$"), "sub": re.compile(r"^(hit|clear)?$")},
     "/dashboard/export": {"kind": re.compile(r"^(auth|incidents|logs)$")},
+    "/guild-dashboard": {"guild": _DIGITS, "ng": re.compile(r"^1?$")},
 }
 _fast_hits: dict[str, deque] = {}
 GUARD_POINTS.update({"scanner_strong": 6, "scanner_weak": 3, "injection": 6, "invalid_input": 2,
                      "bad_method": 2, "tool_ua": 3, "scanner_ua": 6, "machine_speed": 3,
-                     "command_injection": 2, "not_found": 1})
+                     "command_injection": 2, "not_found": 1, "guild_forbidden": 3})
 GUARD_LABEL.update({"scanner_strong": "脆弱性スキャン（機密ファイル・パストラバーサル）",
                     "scanner_weak": "脆弱性スキャン（管理画面・スクリプトの探索）",
                     "injection": "攻撃コードの送信（SQL/OSコマンド/XSS 等）", "invalid_input": "不正な形式の入力",
                     "bad_method": "許可されていないHTTPメソッド", "tool_ua": "自動化ツールによる重要ページへのアクセス",
                     "scanner_ua": "攻撃ツール（スキャナー）の使用", "machine_speed": "機械的な高速リクエスト",
-                    "command_injection": "コマンドへの攻撃コードの入力", "not_found": "存在しないページの総当たり"})
+                    "command_injection": "コマンドへの攻撃コードの入力", "not_found": "存在しないページの総当たり",
+                    "guild_forbidden": "権限のないサーバー設定の操作"})
 
 
 def _plain_page(status: int, title: str, text: str) -> HTMLResponse:
@@ -3885,7 +3889,9 @@ PRIVACY_SECTIONS = [
                 "作成回数）、およびメンバーが参加時に使用した招待リンク",
                 "チケット機能で会話記録（トランスクリプト）を保存した場合の、チケット内のメッセージ本文・"
                 "添付ファイルのリンク・発言者のユーザー名とID・送信日時",
-                "警告・処罰の履歴、サーバー破壊行為（Nuke）・大量参加（Raid）を検知した際の実行者のIDと内容"]),
+                "警告・処罰の履歴、サーバー破壊行為（Nuke）・大量参加（Raid）を検知した際の実行者のIDと内容",
+                "管理ダッシュボードにログインした場合の、参加サーバーの一覧と各サーバーでの権限"
+                "（管理できるサーバーの表示と権限の確認にのみ使い、保存しません）"]),
     ]),
     ("2. 情報の利用目的", [
         ("p", "取得した情報は、以下の目的のためにのみ利用します。"),
@@ -4072,6 +4078,10 @@ async def callback(request: Request, code: str | None = None, state: str | None 
                    error: str | None = None,
                    invited_guild_id: str | None = Query(default=None, alias="guild_id")):
     # ダッシュボードのログイン（state が dash_ で始まる）は、ダッシュボード側で処理する
+    if state and state.startswith("gdash_"):  # サーバー管理者向けダッシュボードのログイン
+        if guild_dashboard_callback is None:
+            return result_page(False, "ダッシュボードは無効です", "guild_dashboard.py が見つかりません。", status=404)
+        return await guild_dashboard_callback(request, None if error else code, state)
     if state and state.startswith("dash_"):
         if dashboard_callback is None:
             return result_page(False, "ダッシュボードは無効です", "dashboard.py が見つかりません。", status=404)
@@ -4276,6 +4286,50 @@ dashboard_callback = None if dashboard is None else dashboard.register(app, Simp
 ))
 
 
+def set_transcript_channel_id(guild_id: int, channel_id: int | None) -> None:
+    data = storage.load("ticket_config", TICKET_CONFIG_FILE)
+    cur = data.setdefault(str(guild_id), {})
+    if channel_id:
+        cur["transcript_channel"] = channel_id
+    else:
+        cur.pop("transcript_channel", None)
+    storage.save("ticket_config", TICKET_CONFIG_FILE, data)
+
+
+def set_subaccount_action(guild_id: int, action: str) -> None:
+    data = storage.load("subaccount_config", SUBACCOUNT_CONFIG_FILE)
+    data[str(guild_id)] = action
+    storage.save("subaccount_config", SUBACCOUNT_CONFIG_FILE, data)
+
+
+def status_info() -> dict:
+    """公開してよい範囲の稼働状況（ダッシュボード表示用）。"""
+    text, _, code = health_monitor.overall()
+    lat = bot.latency
+    up = int(time.time() - BOOT_TIME)
+    return {"text": text, "code": code,
+            "bot": "🟢 オンライン" if bot.is_ready() and not bot.is_closed() else "🔴 オフライン",
+            "ping": f"{round(lat * 1000)} ms" if math.isfinite(lat) else "計測中",
+            "guilds": len(bot.guilds),
+            "uptime": f"{up // 86400}日 {up % 86400 // 3600}時間" if up >= 86400 else f"{up // 3600}時間 {up % 3600 // 60}分",
+            "incidents": [f"{LEVEL_LABEL[i['level']]}：{i['key']}（{STATE_LABEL[i['state']]}）"
+                          for i in sorted(health_monitor.data()["active"].values(), key=lambda i: -i["level"])]}
+
+
+# ---------- サーバー管理者向けダッシュボード（/guild-dashboard） ----------
+guild_dashboard_callback = None if guild_dashboard is None else guild_dashboard.register(app, SimpleNamespace(
+    bot=bot, client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
+    oauth_redirect_uri=lambda: REDIRECT_URI, base_url=lambda: BASE_URL or f"http://localhost:{PORT}",
+    limiter=limiter, guard_web_strike=guard_web_strike, is_user_blacklisted=is_user_blacklisted,
+    is_license_suspended=is_license_suspended, load_config=load_config, save_config=save_config,
+    get_log_channel_id=get_log_channel_id, set_log_channel_id=set_log_channel_id,
+    load_defense_config=load_defense_config, save_defense_config=save_defense_config,
+    get_transcript_channel_id=get_transcript_channel_id, set_transcript_channel_id=set_transcript_channel_id,
+    get_subaccount_action=get_subaccount_action, set_subaccount_action=set_subaccount_action,
+    auth_url=auth_url, send_guild_log=send_guild_log, take_backup=take_backup, status_info=status_info,
+))
+
+
 # ---------- Cloudflare クイックトンネル ----------
 def _download_cloudflared(path: Path) -> bool:
     """cloudflared が無ければ GitHub から取得する（Linuxのみ）。"""
@@ -4388,4 +4442,5 @@ if __name__ == "__main__":
         raise SystemExit("REDIRECT_URI が決まりません。トンネルの起動に失敗したか、"
                          ".env に REDIRECT_URI を設定してください。")
     print(f"所有者専用ダッシュボード: {BASE_URL}/dashboard（ログインは認証と同じ {REDIRECT_URI} を使用）")
+    print(f"サーバー管理者向けダッシュボード: {BASE_URL}/guild-dashboard")
     uvicorn.run(app, host="0.0.0.0", port=PORT, server_header=False)  # サーバーの種類・版を返さない
