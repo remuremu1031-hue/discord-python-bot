@@ -52,7 +52,12 @@ a{color:#7fb0ff;text-decoration:none}
 header{position:sticky;top:0;z-index:20;display:flex;justify-content:space-between;align-items:center;gap:10px;
 padding:12px 16px;background:rgba(10,11,13,.82);backdrop-filter:saturate(160%) blur(14px);
 -webkit-backdrop-filter:saturate(160%) blur(14px);border-bottom:1px solid var(--line)}
-header h1{margin:0;font-size:16px;font-weight:700;letter-spacing:.01em;display:flex;align-items:center;gap:8px;white-space:nowrap}
+header h1{margin:0;font-size:16px;font-weight:700;letter-spacing:.01em;display:flex;align-items:center;gap:8px;
+white-space:nowrap;min-width:0;overflow:hidden}
+header h1 a{min-width:0;overflow:hidden;text-overflow:ellipsis}
+header .btn{white-space:nowrap;min-height:36px;padding:7px 12px;font-size:13px;flex:none}
+header form{flex:none}
+@media (max-width:520px){header h1{font-size:14px}header .me span{display:none}header{padding:10px 12px}}
 header h1 .logo{width:28px;height:28px;border-radius:9px;background:linear-gradient(135deg,var(--blue),#1d4ed8);
 display:inline-flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 4px 14px rgba(37,99,235,.45)}
 header .me{display:flex;gap:8px;align-items:center;color:var(--mut);font-size:13px;min-width:0}
@@ -130,6 +135,16 @@ justify-content:center;font-weight:700;flex:none;border:1px solid var(--line2)}
 code{color:#a5c8ff;background:rgba(59,130,246,.1);padding:1px 6px;border-radius:6px;font-size:12px;word-break:break-all}
 .ghead{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:4px 0 14px}
 form{margin:0}
+.toast{position:fixed;left:50%;bottom:22px;z-index:50;display:flex;align-items:center;gap:10px;width:max-content;max-width:min(92vw,520px);
+padding:12px 18px;border-radius:14px;background:rgba(22,23,27,.96);border:1px solid rgba(59,130,246,.45);color:var(--text);
+font-size:14px;font-weight:600;box-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 4px rgba(59,130,246,.12);
+transform:translate(-50%,0);opacity:0;pointer-events:none;animation:toast 3.6s ease forwards}
+.toast .tick{width:24px;height:24px;border-radius:50%;background:var(--blue);color:#fff;display:inline-flex;
+align-items:center;justify-content:center;font-size:14px;flex:none}
+@keyframes toast{0%{opacity:0;transform:translate(-50%,16px)}10%{opacity:1;transform:translate(-50%,0)}
+80%{opacity:1;transform:translate(-50%,0)}100%{opacity:0;transform:translate(-50%,8px);visibility:hidden}}
+@media (prefers-reduced-motion:reduce){.toast{animation:toast-fade 3.6s steps(1) forwards}}
+@keyframes toast-fade{0%{opacity:1}100%{opacity:0;visibility:hidden}}
 """
 
 
@@ -517,6 +532,9 @@ def register(app, ctx):
             rr_n = len(await rr._get_menus(gid)) if rr else 0
             bk_n = len(ctx.load_backups().get(str(gid), []))
             inv_log = ctx.bot.store_load("invite_log_config").get(str(gid))
+            main_id = ctx.get_main_log_channel_id(gid)
+            main_name = getattr(guild.get_channel(main_id or 0), "name", None)
+            ev_on = bool(ev) and str(ev) != "0" or (not ev and bool(main_id))
             # (キー, アイコン, 名前, 説明, 有効か, トグル可否["both"/"off"/None], 詳細タブ, 必要な権限, 幅広)
             groups = [
                 ("保護", [
@@ -540,13 +558,18 @@ def register(app, ctx):
                     ("weather", "🗾", "天気予報", "全国の天気予報を指定時刻に自動投稿", bool(w), "off", "alerts", "manage_guild", False),
                     ("disaster", "🌊", "災害情報", "地震・津波・火山・気象警報を自動通知", bool(dz.get("channel") or dz.get("quake_channel")), "off", "alerts", "manage_guild", False),
                     ("eew", "🚨", "緊急地震速報", "予想最大震度5弱以上の警報を即時通知", bool(dz.get("eew_channel")), "off", "alerts", "manage_guild", False),
-                    ("eventlog", "📋", "イベントログ", "削除・編集・入退室・VC移動を記録", bool(ev), "off", "automod", "admin", False),
+                    ("eventlog", "📋", "イベントログ", "削除・編集・入退室・VC移動を記録", ev_on, "off", "automod", "admin", False),
+                ]),
+                ("ログ", [
+                    ("mainlog", "🗂️", "メインログ", (f"#{main_name} に、個別に設定していないすべてのログを送信" if main_name
+                     else "個別に設定していないすべてのログを、1つのチャンネルにまとめて送信"), bool(main_id), "off", "logs",
+                     "manage_guild", True),
                 ]),
                 ("運営・管理", [
                     ("tickets", "🎫", "チケット", "ボタンで問い合わせ用チャンネルを作成（トランスクリプト保存）", bool(tc), None, "tickets", "admin", True),
                     ("moderation", "🔨", "モデレーション・警告", "タイムアウト・キック・BAN・警告の管理", True, None, "moderation", "moderate", False),
                     ("backup", "💾", "バックアップ", f"ロール・チャンネル構成の保存と復元（{bk_n}件）", bk_n > 0, None, "security", "admin", False),
-                    ("logs", "📝", "ログ・通知先", "セキュリティログ・トランスクリプト・招待ログの送信先" + ("" if inv_log is None else ""), True, None, "logs", "manage_guild", False),
+                    ("logs", "📝", "個別のログ", "セキュリティ・トランスクリプト・招待ログを、メインログとは別のチャンネルへ", bool(inv_log) or bool(ctx.get_transcript_channel_id(gid)), None, "logs", "manage_guild", False),
                 ]),
             ]
             out = []
@@ -587,15 +610,21 @@ def register(app, ctx):
                     + form("panel_send", lbl("認証パネルを送信するチャンネル") + sel("channel", channel_options(guild, None)),
                            "認証パネルを送信", need="admin"), need="admin"))
         elif tab == "logs":
+            main_id = ctx.get_main_log_channel_id(gid)
             log_id = await ctx.get_log_channel_id(gid)
             inv = ctx.bot.store_load("invite_log_config").get(str(gid))
             bc = ctx.load_broadcast().get(str(gid))
-            html_parts.append(card("📝 ログ・通知の送信先", form("logs_save",
-                lbl("セキュリティ・GBANなどのログ（/set-log-channel）") + sel("log_channel", channel_options(guild, log_id, none_label="（変更しない）"))
-                + lbl("チケットのトランスクリプト（/transcript-channel）") + sel("transcript", channel_options(guild, ctx.get_transcript_channel_id(gid), none_label="（設定しない）"))
-                + lbl("招待リンクの作成・参加の記録（/invite-log）") + sel("invite_log", channel_options(guild, int(inv) if inv else None, none_label="（ログチャンネルと同じ）"))
+            to_main = "（メインログに送る）"
+            html_parts.append(card("🗂️ メインログ（すべてのログ）", form("mainlog_save",
+                lbl("メインログのチャンネル") + sel("channel", channel_options(guild, main_id, none_label="（設定しない）")),
+                "保存する"), note="下で個別のチャンネルを決めていないログは、すべてここに届きます。"
+                "個別に決めたログは、そのチャンネルだけに届きます（メインログには重ねて送りません）。"))
+            html_parts.append(card("📝 個別のログチャンネル", form("logs_save",
+                lbl("セキュリティ・GBAN・設定変更のログ（/set-log-channel）") + sel("log_channel", channel_options(guild, log_id, none_label=to_main))
+                + lbl("チケットのトランスクリプト（/transcript-channel）") + sel("transcript", channel_options(guild, ctx.get_transcript_channel_id(gid), none_label=to_main))
+                + lbl("招待リンクの作成・参加の記録（/invite-log）") + sel("invite_log", channel_options(guild, int(inv) if inv else None, none_label=to_main))
                 + lbl("霊夢BOTからのお知らせ（/broadcast-channel・管理者のみ）") + sel("broadcast", channel_options(guild, bc, none_label="（自動で選ぶ）")),
-                "保存する")))
+                "保存する"), note="認証ログは「認証」タブ、イベントログは「自動モデ・ログ」タブで決められます。"))
         elif tab == "security":
             d = ctx.load_defense_config().get(str(gid), {})
             act = d.get("action", "ban")
@@ -708,14 +737,17 @@ def register(app, ctx):
         elif tab == "automod":
             am = {"spam": False, "invite": False, **(await kv_json(f"automod:{gid}") or {})}
             ev = await kv_get(f"eventlog:{gid}")
+            ev_mode = "off" if str(ev) == "0" else ("main" if not ev else "ch")
             html_parts.append(card("🧹 自動モデレーション（/automod）", form("automod_save",
                 chk("spam", am["spam"], "連続投稿スパムを自動で削除し、5分タイムアウトする")
                 + chk("invite", am["invite"], "招待リンクを自動で削除する"), "保存する", need="admin"), need="admin",
                 note="管理者・「メッセージの管理」権限のメンバーは対象外です。"))
             html_parts.append(card("📋 イベントログ（/eventlog）", form("eventlog_save",
-                lbl("メッセージの削除・編集、入退室、VCの移動を記録するチャンネル")
-                + sel("channel", channel_options(guild, int(ev) if ev and str(ev).isdigit() else None, none_label="（記録しない）")),
-                "保存する", need="admin"), need="admin"))
+                lbl("記録のしかた") + sel("mode", opt("main", "メインログに送る", ev_mode) + opt("ch", "下のチャンネルに送る", ev_mode)
+                                       + opt("off", "記録しない", ev_mode))
+                + lbl("送信先チャンネル（「下のチャンネルに送る」のとき）")
+                + sel("channel", channel_options(guild, int(ev) if ev and str(ev).isdigit() and str(ev) != "0" else None)),
+                "保存する", need="admin"), need="admin", note="メッセージの削除・編集、入退室、VCの移動、チケットのクローズなどを記録します。"))
         elif tab == "roles":
             rr = b_cog("ReactionRoles")
             if rr is None:
@@ -779,7 +811,13 @@ def register(app, ctx):
         nav = "".join(f'<a class="{"on" if k == tab else ""}" '
                       f'href="/guild-dashboard?{httpx.QueryParams({"guild": str(gid), "tab": k})}">{_e(v)}</a>' for k, v in TABS)
         icon = (f'<img src="{_e(guild.icon.replace(size=128).url)}" alt="">' if guild.icon else f'<div class="ph">{_e(guild.name[:1])}</div>')
-        flash = f'<div class="flash{" ng" if is_ng else ""}">{_e(msg)}</div>' if msg else ""
+        if not msg:
+            flash = ""
+        elif is_ng:
+            flash = f'<div class="flash ng">{_e(msg)}</div>'
+        else:  # 保存できたときは、画面下に数秒だけ表示して消える（スクリプトなし・CSSのアニメーションだけ）
+            flash = (f'<div class="toast" role="status"><span class="tick">✓</span>'
+                     f'<span>{_e(msg.removeprefix("✅").strip())}</span></div>')
         role_text = "管理者" if perms["admin"] else "サーバー管理"
         body = (status_card() + f'<div class="g" style="margin-bottom:12px">{icon}<div><div class="n" style="font-size:19px">{_e(guild.name)}</div>'
                 f'<div class="mut">あなたの権限: {role_text} ・ <a href="/guild-dashboard">サーバー一覧に戻る</a></div></div></div>'
@@ -796,7 +834,7 @@ def register(app, ctx):
                "ticket_setup": "admin", "ticket_panel": "admin", "mod_action": "admin", "warn_add": "moderate",
                "warn_clear": "admin", "automod_save": "admin", "eventlog_save": "admin", "rr_create": "admin",
                "rr_edit": "admin", "rr_send": "admin", "rr_delete": "admin", "mass_role": "admin",
-               "module_toggle": "manage_guild"}
+               "module_toggle": "manage_guild", "mainlog_save": "manage_guild"}
 
     @app.post("/guild-dashboard/save")
     @ctx.limiter.limit("30/minute")
@@ -829,14 +867,7 @@ def register(app, ctx):
             ok = True
         except ValueError as e:
             done, ok = str(e), False
-        if ok and done:
-            e = discord.Embed(title="🛠️ ダッシュボードで設定が変更されました", color=0x5865F2, description=done[:2000])
-            e.add_field(name="変更した人", value=f"<@{member.id}>（`{member}` / `{member.id}`）")
-            try:
-                await ctx.send_guild_log(guild, e)
-            except Exception:
-                pass
-        msg = ("✅ " + done) if ok else ("⚠️ " + done)
+        msg = ("✅ " + (done or "変更はありませんでした")) if ok else ("⚠️ " + done)
         q = httpx.QueryParams({"guild": str(gid), "tab": tab, "msg": msg[:280], **({} if ok else {"ng": "1"})})
         return _headers(RedirectResponse(f"/guild-dashboard?{q}", status_code=303))
 
@@ -897,19 +928,30 @@ def register(app, ctx):
             ch = pick_channel(guild, f.get("channel"), required=True)
             await ctx.send_auth_panel(guild, ch)
             return f"#{ch.name} に認証パネルを送信しました"
+        if op == "mainlog_save":
+            ch = pick_channel(guild, f.get("channel"))
+            ctx.set_main_log_channel_id(gid, ch.id if ch else None)
+            ev = b_cog("EventLogs")
+            if ev is not None and hasattr(ev, "_stamp"):
+                ev._stamp.clear()  # イベントログの送信先を読み直させる
+            return f"メインログを {('#' + ch.name) if ch else '解除'} にしました"
         if op == "logs_save":
             out = []
             ch = pick_channel(guild, f.get("log_channel"))
-            if ch is not None and ch.id != await ctx.get_log_channel_id(gid):
+            cur_log = await ctx.get_log_channel_id(gid)
+            if (ch.id if ch else None) != cur_log:
                 try:
-                    await ctx.set_log_channel_id(gid, ch.id)
+                    if ch:
+                        await ctx.set_log_channel_id(gid, ch.id)
+                    else:
+                        await ctx.del_log_channel_id(gid)
                 except Exception:
                     raise ValueError("ログチャンネルを保存できませんでした（データベースが未設定か一時的な障害）")
-                out.append(f"ログ #{ch.name}")
+                out.append(f"セキュリティログ {('#' + ch.name) if ch else '→ メインログ'}")
             tr = pick_channel(guild, f.get("transcript"), attach=True)
             if (tr.id if tr else None) != ctx.get_transcript_channel_id(gid):
                 ctx.set_transcript_channel_id(gid, tr.id if tr else None)
-                out.append(f"トランスクリプト {('#' + tr.name) if tr else '解除'}")
+                out.append(f"トランスクリプト {('#' + tr.name) if tr else '→ メインログ'}")
             inv = pick_channel(guild, f.get("invite_log"))
             data = b.store_load("invite_log_config")
             if (inv.id if inv else None) != data.get(str(gid)):
@@ -918,7 +960,7 @@ def register(app, ctx):
                 else:
                     data.pop(str(gid), None)
                 b.store_save("invite_log_config", data)
-                out.append(f"招待ログ {('#' + inv.name) if inv else 'ログチャンネルと同じ'}")
+                out.append(f"招待ログ {('#' + inv.name) if inv else '→ メインログ'}")
             if perms["admin"]:
                 bc = pick_channel(guild, f.get("broadcast"))
                 data = ctx.load_broadcast()
@@ -1093,7 +1135,7 @@ def register(app, ctx):
             key, on = f.get("key", ""), f.get("to") == "1"
             need = {"nuke": "admin", "raid": "admin", "inviteblock": "admin", "spam": "admin", "amInvite": "admin",
                     "subaccount": "admin", "levels": "manage_guild", "weather": "manage_guild", "disaster": "manage_guild",
-                    "eew": "manage_guild", "eventlog": "admin"}.get(key)
+                    "eew": "manage_guild", "eventlog": "admin", "mainlog": "manage_guild"}.get(key)
             if need is None:
                 raise ValueError("このモジュールは切り替えられません")
             if not perms[need]:
@@ -1149,11 +1191,14 @@ def register(app, ctx):
                 b.store_save("disaster_config", data)
                 return f"{'災害情報' if key == 'disaster' else '緊急地震速報'}の通知を停止しました"
             if key == "eventlog":
-                await b.kv("delete", f"eventlog:{gid}")
+                await b.kv("set", f"eventlog:{gid}", "0")
                 cog = b_cog("EventLogs")
                 if cog is not None:
-                    cog._cache[gid] = None
+                    cog._cache.pop(gid, None)
                 return "イベントログを停止しました"
+            if key == "mainlog":
+                ctx.set_main_log_channel_id(gid, None)
+                return "メインログを解除しました"
             raise ValueError("不明なモジュールです")
         # ---------- チケット ----------
         if op == "ticket_setup":
@@ -1267,15 +1312,21 @@ def register(app, ctx):
                 cog._cfg[gid] = (_t.monotonic(), cfg)  # すぐに反映する
             return f"自動モデレーション: スパム {'オン' if cfg['spam'] else 'オフ'} ／ 招待リンク {'オン' if cfg['invite'] else 'オフ'}"
         if op == "eventlog_save":
-            ch = pick_channel(guild, f.get("channel"))
-            if ch is None:
-                await b.kv("delete", f"eventlog:{gid}")
-            else:
+            mode = f.get("mode")
+            if mode == "ch":
+                ch = pick_channel(guild, f.get("channel"), required=True)
                 await b.kv("set", f"eventlog:{gid}", str(ch.id))
+                res = f"イベントログ: #{ch.name}"
+            elif mode == "off":
+                await b.kv("set", f"eventlog:{gid}", "0")
+                res = "イベントログ: 記録しない"
+            else:
+                await b.kv("delete", f"eventlog:{gid}")
+                res = "イベントログ: メインログに送る"
             cog = b_cog("EventLogs")
             if cog is not None:
-                cog._cache[gid] = ch.id if ch else None
-            return f"イベントログ: {('#' + ch.name) if ch else '記録しない'}"
+                cog._cache.pop(gid, None)
+            return res
         # ---------- リアクションロール ----------
         if op.startswith("rr_"):
             rr = b_cog("ReactionRoles")
