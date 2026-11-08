@@ -3407,7 +3407,8 @@ QUERY_RULES: dict[str, dict[str, re.Pattern]] = {
                   "iss": re.compile(r"^https://discord(app)?\.com/?$")},  # Discordが付ける発行元（RFC 9207）
     "/dashboard": {"tab": re.compile(r"^[a-z]{1,20}$"), "sub": re.compile(r"^(hit|clear)?$")},
     "/dashboard/export": {"kind": re.compile(r"^(auth|incidents|logs)$")},
-    "/guild-dashboard": {"guild": _DIGITS, "ng": re.compile(r"^1?$")},
+    "/guild-dashboard": {"guild": _DIGITS, "ng": re.compile(r"^1?$"), "tab": re.compile(r"^[a-z]{1,20}$"),
+                         "q": re.compile(r"^\d{0,21}$")},
 }
 _fast_hits: dict[str, deque] = {}
 GUARD_POINTS.update({"scanner_strong": 6, "scanner_weak": 3, "injection": 6, "invalid_input": 2,
@@ -4301,6 +4302,26 @@ dashboard_callback = None if dashboard is None else dashboard.register(app, Simp
 ))
 
 
+async def send_auth_panel(guild: discord.Guild, channel: discord.TextChannel) -> None:
+    """認証パネルを送る（/panel と同じ内容。ダッシュボードから使う）。"""
+    gcfg = load_config().get(str(guild.id))
+    if gcfg is None:
+        raise ValueError("先に認証の設定（認証ロール・認証ログ）を保存してください")
+    role = guild.get_role(gcfg["role_id"])
+    embed = discord.Embed(
+        title="🔐 サーバー認証",
+        description=(f"下のボタンを押してDiscordでログインすると、認証が完了して"
+                     f"{role.mention if role else '認証ロール'} が自動で付与されます。"),
+        color=0x5865F2)
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="認証する", emoji="✅", style=discord.ButtonStyle.link,
+                                    url=auth_url(guild.id)))
+    try:
+        await channel.send(embed=embed, view=view)
+    except discord.HTTPException:
+        raise ValueError("認証パネルを送信できませんでした（Botの権限・公開URLの設定を確認してください）")
+
+
 def set_transcript_channel_id(guild_id: int, channel_id: int | None) -> None:
     data = storage.load("ticket_config", TICKET_CONFIG_FILE)
     cur = data.setdefault(str(guild_id), {})
@@ -4342,6 +4363,9 @@ guild_dashboard_callback = None if guild_dashboard is None else guild_dashboard.
     get_transcript_channel_id=get_transcript_channel_id, set_transcript_channel_id=set_transcript_channel_id,
     get_subaccount_action=get_subaccount_action, set_subaccount_action=set_subaccount_action,
     auth_url=auth_url, send_guild_log=send_guild_log, take_backup=take_backup, status_info=status_info,
+    send_auth_panel=send_auth_panel, load_broadcast=load_broadcast, save_broadcast=save_broadcast,
+    load_server_blacklist=load_server_blacklist, save_server_blacklist=save_server_blacklist,
+    load_backups=load_backups, restore_backup=restore_backup,
 ))
 
 
