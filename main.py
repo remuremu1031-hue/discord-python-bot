@@ -56,6 +56,7 @@ def _import_optional(name: str):
 
 dashboard = _import_optional("dashboard")  # 所有者専用Webダッシュボード（dashboard.py）
 transcript = _import_optional("transcript")
+home = _import_optional("home")  # 公式サイト（トップページ・ガイド・デモ・稼働状況）
 guild_dashboard = _import_optional("guild_dashboard")  # サーバー管理者向けダッシュボード（guild_dashboard.py）  # チケットのトランスクリプト生成（transcript.py）
 
 
@@ -4086,8 +4087,10 @@ async def health():
 @limiter.limit(RATE_LIMIT_INDEX)
 async def index(request: Request, guild: int | None = None):
     if guild is None:
-        # サーバー指定なしのアクセス（死活監視のping等）は、200で応答する
-        return result_page(True, "認証Bot 稼働中",
+        # サーバー指定なしのアクセスは、公式サイトのトップページ（死活監視のpingにも200で応答）
+        if home_site is not None:
+            return home_site.landing()
+        return result_page(True, "霊夢BOT 稼働中",
                            "認証ページは、サーバー管理者が案内するURLからアクセスしてください。")
     if is_license_suspended(guild):
         return license_suspended_page()
@@ -4426,6 +4429,12 @@ guild_dashboard_callback = None if guild_dashboard is None else guild_dashboard.
     get_main_log_channel_id=get_main_log_channel_id, set_main_log_channel_id=set_main_log_channel_id,
     del_log_channel_id=del_log_channel_id,
 ))
+
+
+# ---------- 公式サイト（/ ・ /guide ・ /demo ・ /status） ----------
+home_site = None if home is None else home.register(app, SimpleNamespace(
+    bot=bot, client_id=CLIENT_ID, status_info=status_info, limiter=limiter,
+    invite_url=os.getenv("BOT_INVITE_URL") or None))
 
 
 # ---------- Cloudflare クイックトンネル ----------
