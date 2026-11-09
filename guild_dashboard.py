@@ -15,6 +15,7 @@ import hmac
 import html
 import json
 import secrets
+import re
 import sys
 import time
 from urllib.parse import parse_qs
@@ -204,8 +205,9 @@ def register(app, ctx):
                   f'</form></div>')
         doc = (f'<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" '
                f'content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>{TITLE}</title>'
-               f'<style>{CSS}</style></head><body><header><h1><a href="/guild-dashboard" style="color:inherit;display:flex;'
-               f'align-items:center;gap:8px"><span class="logo">⛩️</span>{TITLE}</a></h1>{me}</header>'
+               f'<style>{CSS}</style></head><body><header><h1 style="display:flex;align-items:center;gap:8px">'
+               f'<a href="/" title="公式サイト（ホーム）へ" aria-label="公式サイト（ホーム）へ"><span class="logo">⛩️</span></a>'
+               f'<a href="/guild-dashboard" style="color:inherit">{TITLE}</a></h1>{me}</header>'
                f'<main>{body}</main></body></html>')
         return _headers(HTMLResponse(doc, status_code=status))
 
@@ -402,6 +404,9 @@ def register(app, ctx):
             ("roles", "🎭 ロール"), ("sticky", "📌 案内の固定"), ("alerts", "🌦️ 天気・災害"), ("levels", "📈 レベル"),
             ("events", "🎉 イベント・投票"), ("tools", "🧰 便利ツール"), ("media", "📺 配信・VC")]
     EXT_TABS = ("events", "tools", "media")
+    KIND_LABEL = {"channel_delete": "チャンネルの大量削除", "channel_create": "チャンネルの大量作成",
+                  "role_delete": "ロールの大量削除", "role_create": "ロールの大量作成", "ban": "連続BAN",
+                  "kick": "連続キック", "webhook_create": "Webhookの大量作成", "prune": "メンバーの一括削除（Prune）"}
     # extras.py（追加モジュール）の操作と必要な権限
     EXT_NEED = {"x_ocr": "admin", "x_event": "manage_guild", "x_poll": "manage_guild", "x_poll_close": "manage_guild",
                 "x_event_delete": "manage_guild", "x_translate": "manage_guild", "x_automsg_add": "manage_guild",
@@ -688,6 +693,32 @@ def register(app, ctx):
                 lbl("ユーザーID") + '<input type="text" name="uid" inputmode="numeric" maxlength="21" placeholder="例: 123456789012345678">'
                 + lbl("操作") + sel("mode", opt("add", "追加", "add") + opt("remove", "削除", "")), "実行", need="admin"), need="admin",
                 note="Nuke検知の対象外にするユーザー・BOTです。"))
+            # ---- 除外設定（/defense-exempt） ----
+            ex_roles = {int(x) for x in d.get("nuke_exempt_roles", [])}
+            ex_chans = {int(x) for x in d.get("nuke_exempt_channels", [])}
+            ex_kinds = set(d.get("nuke_exempt_kinds", []))
+            role_box = "".join(chk(f"r_{r.id}", r.id in ex_roles, "@" + r.name)
+                               for r in reversed(guild.roles) if not r.is_default() and not r.managed)
+            chan_box = "".join(chk(f"c_{c.id}", c.id in ex_chans, ("📁 " if str(getattr(c, "type", "")) == "category" else "#") + c.name)
+                               for c in sorted(guild.channels, key=lambda c: (c.position, c.id)))
+            kind_box = "".join(chk(f"k_{k}", k in ex_kinds, v) for k, v in KIND_LABEL.items())
+            scroll = '<div style="max-height:220px;overflow:auto;border:1px solid var(--line,#263243);border-radius:10px;padding:6px 10px">{}</div>'
+            html_parts.append(card("🚫 Nukeの除外（/defense-exempt）", form("nuke_exempt",
+                lbl("このロールを持つ人の操作は検知しない") + scroll.format(role_box or '<span class="mut">ロールがありません</span>')
+                + lbl("このチャンネル・カテゴリの作成・削除は数えない") + scroll.format(chan_box)
+                + lbl("検知しない操作") + kind_box
+                + lbl("その他") + chk("bots", d.get("nuke_exempt_bots"), "BOTによる操作をすべて検知しない"),
+                "保存する", need="admin"), need="admin",
+                note="ユーザー単位の除外は、上の「信頼済みユーザー」で設定します。自動で一時チャンネルを作るBOTなどがいる場合に使ってください。"))
+            r_users = "\n".join(str(u) for u in d.get("raid_exempt_users", []))
+            r_inv = "\n".join(d.get("raid_exempt_invites", []))
+            html_parts.append(card("🚫 Raidの除外（/defense-exempt）", form("raid_exempt",
+                lbl("除外するユーザーID（1行に1人）") + f'<textarea name="users" rows="3" maxlength="4000">{_e(r_users)}</textarea>'
+                + lbl("この招待リンクからの参加は数えない（コードまたはURL・1行に1つ）") + f'<textarea name="invites" rows="3" maxlength="2000" placeholder="例: abcDEF12">{_e(r_inv)}</textarea>'
+                + lbl("アカウント作成からこの日数以上の人は数えない（0で制限なし）")
+                + f'<input type="number" name="min_age" min="0" max="3650" value="{int(d.get("raid_min_age_days", 0) or 0)}">',
+                "保存する", need="admin"), need="admin",
+                note="除外された人は、Raidモード中でもキックされません。イベント用の招待リンクなど、一度に人が集まるときに使ってください。"))
             sbl = ctx.load_server_blacklist().get(str(gid), [])
             sbl_html = "".join(f'<div class="mut">・<code>{u}</code></div>' for u in sbl[:50]) or '<div class="mut">登録なし</div>'
             html_parts.append(card("⛔ このサーバーのブラックリスト（/server-blacklist）", sbl_html + form("sbl_edit",
@@ -881,7 +912,7 @@ def register(app, ctx):
 
     # ================= 保存 =================
     OP_NEED = {"auth_save": "admin", "panel_send": "admin", "logs_save": "manage_guild", "nuke_save": "admin",
-               "wl_edit": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
+               "wl_edit": "admin", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
                "sticky_set": "manage_messages", "sticky_remove": "manage_messages", "weather_save": "manage_guild",
                "disaster_save": "manage_guild", "quake_save": "manage_guild", "eew_save": "manage_guild",
                "level_save": "manage_guild", "level_role": "manage_guild", "level_noxp": "manage_guild",
@@ -1053,6 +1084,40 @@ def register(app, ctx):
                 except Exception:
                     pass
             return "Nuke・Raid対策の設定を保存しました"
+        if op == "nuke_exempt":
+            dcfg = ctx.load_defense_config()
+            d = dcfg.setdefault(str(gid), {})
+            valid_r = {r.id for r in guild.roles}
+            valid_c = {c.id for c in guild.channels}
+            d["nuke_exempt_roles"] = [int(k[2:]) for k in f if k.startswith("r_") and k[2:].isdigit() and int(k[2:]) in valid_r][:200]
+            d["nuke_exempt_channels"] = [int(k[2:]) for k in f if k.startswith("c_") and k[2:].isdigit() and int(k[2:]) in valid_c][:200]
+            d["nuke_exempt_kinds"] = [k[2:] for k in f if k.startswith("k_") and k[2:] in KIND_LABEL]
+            d["nuke_exempt_bots"] = f.get("bots") == "1"
+            ctx.save_defense_config(dcfg)
+            return (f"Nukeの除外を保存しました（ロール {len(d['nuke_exempt_roles'])}・チャンネル {len(d['nuke_exempt_channels'])}"
+                    f"・操作 {len(d['nuke_exempt_kinds'])}）")
+        if op == "raid_exempt":
+            dcfg = ctx.load_defense_config()
+            d = dcfg.setdefault(str(gid), {})
+            users = []
+            for ln in (f.get("users") or "").split():
+                if not re.fullmatch(r"\d{15,21}", ln.strip()):
+                    raise ValueError(f"ユーザーIDの形式が正しくありません: {ln[:25]}")
+                if int(ln) not in users:
+                    users.append(int(ln))
+            codes = []
+            for ln in (f.get("invites") or "").split():
+                c = re.sub(r"^(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/", "", ln.strip()).strip("/")
+                if not re.fullmatch(r"[A-Za-z0-9-]{2,32}", c):
+                    raise ValueError(f"招待リンクの形式が正しくありません: {ln[:40]}")
+                if c not in codes:
+                    codes.append(c)
+            age = (f.get("min_age") or "0").strip()
+            if not age.isdigit() or int(age) > 3650:
+                raise ValueError("日数は 0〜3650 で指定してください")
+            d["raid_exempt_users"], d["raid_exempt_invites"], d["raid_min_age_days"] = users[:200], codes[:100], int(age)
+            ctx.save_defense_config(dcfg)
+            return f"Raidの除外を保存しました（ユーザー {len(users)}・招待リンク {len(codes)}・日数 {int(age)}日）"
         if op in ("wl_edit", "sbl_edit"):
             uid = pick_uid(f.get("uid"))
             add = f.get("mode") == "add"
@@ -1112,7 +1177,6 @@ def register(app, ctx):
                 data.pop(str(gid), None)
                 b.store_save("weather_config", data)
                 return "天気予報の自動投稿を停止しました"
-            import re
             times = []
             for t in (f.get("times") or "07:00").replace("、", ",").split(","):
                 m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", t)

@@ -156,7 +156,7 @@ def register(app, ctx):
         doc = f"""<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
 <title>霊夢BOT 管理ダッシュボード</title><style>{CSS}</style></head><body>
-<header><h1>🛡️ 霊夢BOT 管理ダッシュボード</h1><div class="me">{av}<span>{_e(sess["name"])}</span>
+<header><h1>🛡️ 霊夢BOT 管理ダッシュボード <a href="/#updates" style="font-size:13px;font-weight:600;margin-left:8px">🏠 公式サイト・お知らせ投稿 ›</a></h1><div class="me">{av}<span>{_e(sess["name"])}</span>
 <form class="inline" method="post" action="/dashboard/logout"><input type="hidden" name="csrf" value="{_e(sess['csrf'])}">
 <button class="ghost">ログアウト</button></form></div></header>
 <nav>{nav}</nav><main>{f'<div class="flash">{_e(flash)}</div>' if flash else ""}{body}</main></body></html>"""
@@ -543,7 +543,7 @@ def register(app, ctx):
         print(f"ダッシュボードにログインしました（オーナー ID: {uid}）")
         resp = RedirectResponse("/dashboard", status_code=303)
         resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True, secure=cookie_secure(),
-                        samesite="lax", path="/dashboard")
+                        samesite="lax", path="/")  # 公式サイト（/）のお知らせ投稿でも使う
         resp.delete_cookie(STATE_COOKIE, path="/")
         return _secure_headers(resp)
 
@@ -558,7 +558,8 @@ def register(app, ctx):
         if sess and secrets.compare_digest(f.get("csrf", ""), sess["csrf"]):
             _sessions.pop(request.cookies.get(SESSION_COOKIE, ""), None)
         resp = RedirectResponse("/dashboard/login", status_code=303)
-        resp.delete_cookie(SESSION_COOKIE, path="/dashboard")
+        resp.delete_cookie(SESSION_COOKIE, path="/")
+        resp.delete_cookie(SESSION_COOKIE, path="/dashboard")  # 以前の設定で発行したもの
         return _secure_headers(resp)
 
     def _id(v: str) -> int | None:
@@ -665,4 +666,5 @@ def register(app, ctx):
         resp.headers["Content-Disposition"] = f'attachment; filename="{kind}-{int(time.time())}.json"'
         return _secure_headers(resp)
 
+    dashboard_callback.current = current  # 公式サイトから「所有者としてログイン中か」を調べる窓口
     return dashboard_callback

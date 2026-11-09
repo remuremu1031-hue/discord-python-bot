@@ -7,7 +7,7 @@ from discord.ext import commands
 
 CATEGORIES = [
     ("🔐 認証", ["setup", "authlink", "panel", "subaccount", "server-blacklist"]),
-    ("🛡️ セキュリティ", ["nuke-defense", "nuke-whitelist", "backup", "set-log-channel", "automod", "eventlog"]),
+    ("🛡️ セキュリティ", ["nuke-defense", "nuke-whitelist", "defense-exempt", "backup", "set-log-channel", "automod", "eventlog"]),
     ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "mass_role"]),
     ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "main-log", "invite-log", "invite-stats", "invite-recount", "weather",
                     "disaster", "broadcast-channel", "help"]),
@@ -40,6 +40,7 @@ GUIDE = {
     "subaccount": "同じIPから別アカウントが認証したとき「拒否」か「記録のみ」かを選べます。BAN・ブラックリスト対象と同じIPは常に拒否されます。",
     "nuke-defense": "大量削除・連続BANなどを検知し、実行者を自動でBAN/キック/権限剥奪し、消えたチャンネル・ロールを復元します。Botのロールは一番上に置いてください。",
     "nuke-whitelist": "Nuke検知の対象外にする信頼済みのユーザー・BOTを登録します。",
+    "defense-exempt": "Nuke・Raid対策で反応しない対象（ユーザー・ロール・チャンネル・操作の種類・招待リンク・アカウント日数）を設定します。",
     "backup": "`create` で保存、`list` で一覧、`restore number:番号` で足りないロール・チャンネルを作り直します。",
     "transcript-channel": "チケットのトランスクリプト（HTML＋テキスト）を送るチャンネルを設定します。",
     "reactionrole": "`menu-create` → `menu-add`（一度に5個まで追加）→ `menu-send` で、何個でも同時に選べるロールメニューを作れます。従来の絵文字リアクション方式は `add` / `remove` / `list`。",

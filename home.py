@@ -11,10 +11,15 @@ main.py から register(app, ctx) を呼ぶと、次のページが使えるよ�
 from __future__ import annotations
 
 import html
+import secrets
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs
 from types import SimpleNamespace
 
 from fastapi import Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 SUPPORT_URL = "https://discord.gg/eWpUkX9bPM"
 
@@ -72,7 +77,7 @@ PILLARS = [
     ("語り合う", "💬", "レベル・ランク、イベント、アンケート、翻訳、FAQ。会話が生まれ、コミュニティが育つ仕組みを。"),
 ]
 
-# お知らせ（新しい順）
+# お知らせの初期値（新しい順）。所有者がトップページから投稿すると、そちらが使われる
 UPDATES = [
     ("2026.11", "NEW", "13の追加モジュールを公開", "OCR画像検閲・イベント・アンケート・翻訳・YouTube Push など、運営に役立つモジュールを追加しました。"),
     ("2026.11", "UPDATE", "サーバー管理ダッシュボードを刷新", "すべてのコマンドの設定がブラウザから行えるようになりました。モジュールの一覧からワンタップで切り替えできます。"),
@@ -257,6 +262,17 @@ code{background:var(--card2);border:1px solid var(--line2);border-radius:6px;pad
 .ff label{display:block;color:var(--mut);font-size:12.5px;margin:12px 0 5px}
 .ff select,.ff input[type=text],.ff textarea{width:100%;background:var(--bg2);color:var(--text);border:1px solid var(--line2);border-radius:10px;padding:10px;font:inherit;font-size:14px}
 .ff .b{margin-top:14px;display:inline-block;padding:10px 18px;border-radius:10px;background:var(--blue);color:#fff;font-weight:700;font-size:14px;border:0;opacity:.6}
+/* 所有者用のお知らせ投稿 */
+.own{margin-bottom:16px;border:1px dashed rgba(59,130,246,.5);border-radius:20px;padding:20px;background:rgba(59,130,246,.05)}
+.own h3{margin:0 0 4px;font-size:16px}.own .mut{color:var(--mut);font-size:13px;margin:0 0 12px}
+.own form{display:grid;grid-template-columns:150px 150px 1fr;gap:10px}
+.own input,.own select,.own textarea{width:100%;background:var(--bg2);color:var(--text);border:1px solid var(--line2);border-radius:10px;padding:10px;font:inherit;font-size:14px}
+.own textarea,.own .full{grid-column:1/-1}
+.own button,.del button{cursor:pointer;font:inherit;font-weight:700;border-radius:10px;border:0}
+.own button{padding:11px 18px;background:var(--blue);color:#fff;width:max-content}
+.del{margin:0}.del button{padding:5px 10px;font-size:12px;background:rgba(239,68,68,.12);color:#fca5a5;border:1px solid rgba(239,68,68,.3)}
+.ui.adm{grid-template-columns:110px 90px 1fr auto}
+@media(max-width:700px){.own form{grid-template-columns:1fr 1fr}.ui.adm{grid-template-columns:auto 1fr auto}}
 .note{margin:14px 0 0;padding:12px 14px;border-radius:12px;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);color:#bfdbfe;font-size:13.5px}
 """
 
@@ -278,10 +294,32 @@ def register(app, ctx) -> SimpleNamespace:
         except Exception:
             return ""
 
+    JST = timezone(timedelta(hours=9))
+    LABELS = ["NEW", "UPDATE", "INFO", "FIX", "MAINTENANCE"]
+
+    def load_updates() -> list[dict]:
+        try:
+            data = ctx.load_updates() or {}
+        except Exception:
+            data = {}
+        if "items" not in data:  # まだ一度も投稿していない → 初期値を表示
+            return [{"id": f"d{i}", "date": dt, "label": lb, "title": t, "body": d} for i, (dt, lb, t, d) in enumerate(UPDATES)]
+        return list(data["items"])
+
+    async def owner_session(request: Request) -> dict | None:
+        """所有者専用ダッシュボード（/dashboard）にログイン中の所有者なら、そのセッションを返す。"""
+        fn = getattr(ctx, "owner_session", None)
+        if fn is None:
+            return None
+        try:
+            return await fn(request)
+        except Exception:
+            return None
+
     def respond(doc: str, status: int = 200) -> HTMLResponse:
         r = HTMLResponse(doc, status_code=status)
         r.headers["Content-Security-Policy"] = ("default-src 'none'; style-src 'unsafe-inline'; img-src 'self' https://cdn.discordapp.com data:; "
-                                                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+                                                "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
         r.headers["Cache-Control"] = "public, max-age=300"
         return r
 
@@ -322,7 +360,8 @@ def register(app, ctx) -> SimpleNamespace:
                 f'<div class="in"><div class="side">{side}</div><div class="main">'
                 f'<div class="sh">🧩 モジュール <small>・ ワンタップで切り替え</small></div><div class="mg">{mm}</div></div></div></div>')
 
-    def landing() -> HTMLResponse:
+    async def landing(request: Request) -> HTMLResponse:
+        sess = await owner_session(request)
         inv = _e(invite_url())
         try:
             info = ctx.status_info()
@@ -340,8 +379,30 @@ def register(app, ctx) -> SimpleNamespace:
             f'<a href="/guide#{key}">使い方を見る →</a></div>'
             for i, (key, ic, name, desc, _u, _t, state) in enumerate(MODULES, 1))
         steps = "".join(f'<div class="st"><div class="n">{n}</div><h3>{_e(t)}</h3><p>{_e(d)}</p></div>' for n, t, d in STEPS)
-        upd = "".join(f'<div class="ui"><time>{_e(dt)}</time><span class="lb{" up" if lb != "NEW" else ""}">{_e(lb)}</span>'
-                      f'<div><b>{_e(t)}</b><span class="d">{_e(d)}</span></div></div>' for dt, lb, t, d in UPDATES)
+        items = load_updates()
+        csrf = _e(sess["csrf"]) if sess else ""
+
+        def del_btn(it):
+            if not sess:
+                return ""
+            return (f'<form class="del" method="post" action="/home/updates"><input type="hidden" name="csrf" value="{csrf}">'
+                    f'<input type="hidden" name="op" value="delete"><input type="hidden" name="id" value="{_e(it.get("id", ""))}">'
+                    f'<button type="submit">削除</button></form>')
+        upd = "".join(f'<div class="ui{" adm" if sess else ""}"><time>{_e(it.get("date", ""))}</time>'
+                      f'<span class="lb{" up" if it.get("label") != "NEW" else ""}">{_e(it.get("label", ""))}</span>'
+                      f'<div><b>{_e(it.get("title", ""))}</b><span class="d">{_e(it.get("body", ""))}</span></div>{del_btn(it)}</div>'
+                      for it in items[:10]) or '<div class="ui"><div class="d" style="color:var(--mut)">お知らせはまだありません。</div></div>'
+        own = ""
+        if sess:
+            today = datetime.now(JST).strftime("%Y.%m.%d")
+            own = (f'<div class="own"><h3>✍️ お知らせを投稿（所有者のみ表示）</h3>'
+                   f'<p class="mut">{_e(sess.get("name", ""))} としてログイン中です。投稿すると、すぐにこのページへ反映されます。</p>'
+                   f'<form method="post" action="/home/updates"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="op" value="add">'
+                   f'<input type="text" name="date" value="{today}" maxlength="20" aria-label="日付">'
+                   f'<select name="label" aria-label="ラベル">{"".join(f"<option>{x}</option>" for x in LABELS)}</select>'
+                   f'<input type="text" name="title" maxlength="80" required placeholder="タイトル" aria-label="タイトル">'
+                   f'<textarea name="body" rows="3" maxlength="400" placeholder="本文（400文字まで）" aria-label="本文"></textarea>'
+                   f'<button type="submit">投稿する</button></form></div>')
         body = f"""
 <div class="hero"><div class="wrap">
 <span class="pill"><i></i>13の新モジュールを追加しました</span>
@@ -365,14 +426,45 @@ def register(app, ctx) -> SimpleNamespace:
 
 <section id="updates"><div class="wrap"><div class="head"><div class="eyebrow">LATEST UPDATES</div>
 <h2>お知らせ</h2><p class="sub">最新の機能追加やアップデートの情報です。</p></div>
-<div class="upd">{upd}</div></div></section>
+{own}<div class="upd">{upd}</div></div></section>
 
 <section style="padding-top:20px"><div class="wrap"><div class="final">
 <div class="eyebrow">GET STARTED</div><h2>あなたのサーバーにも、霊夢BOTを。</h2>
 <p class="sub" style="margin:0 auto">導入は無料。困ったときは、サポートサーバーでお気軽にご相談ください。</p>
 <div class="cta"><a class="btn pri" href="{inv}" target="_blank" rel="noopener">Discordに追加する ↗</a>
 <a class="btn ghost" href="{SUPPORT_URL}" target="_blank" rel="noopener">サポートサーバー ↗</a></div></div></div></section>"""
-        return respond(shell("霊夢BOT ｜ 守り、整え、語り合う。", body))
+        r = respond(shell("霊夢BOT ｜ 守り、整え、語り合う。", body))
+        r.headers["Cache-Control"] = "no-store" if sess else "public, max-age=60"
+        return r
+
+    # ---------------- お知らせの投稿・削除（所有者のみ） ----------------
+    @app.post("/home/updates")
+    @ctx.limiter.limit("20/minute")
+    async def post_updates(request: Request):
+        sess = await owner_session(request)
+        body = (await request.body())[:6000].decode("utf-8", "replace")
+        f = {k: v[0] for k, v in parse_qs(body).items()}
+        if not sess or not secrets.compare_digest(f.get("csrf", ""), sess.get("csrf", "")):
+            strike = getattr(ctx, "guard_web_strike", None)
+            if strike:
+                try:
+                    strike(request, "home_forbidden", "/home/updates")
+                except Exception:
+                    pass
+            return respond(shell("権限がありません ｜ 霊夢BOT", '<div class="page"><div class="wrap"><h2>権限がありません</h2>'
+                                 '<p class="sub">お知らせを投稿できるのは、BOTの所有者だけです。</p></div></div>'), 403)
+        items = load_updates()
+        if f.get("op") == "add":
+            title = (f.get("title") or "").strip()[:80]
+            if title:
+                label = f.get("label") if f.get("label") in LABELS else "INFO"
+                date = (f.get("date") or "").strip()[:20] or datetime.now(JST).strftime("%Y.%m.%d")
+                items.insert(0, {"id": uuid.uuid4().hex[:12], "date": date, "label": label, "title": title,
+                                 "body": (f.get("body") or "").strip()[:400], "by": sess.get("uid"), "t": int(time.time())})
+        elif f.get("op") == "delete":
+            items = [it for it in items if it.get("id") != f.get("id")]
+        ctx.save_updates({"items": items[:30]})
+        return RedirectResponse("/#updates", status_code=303)
 
     # ---------------- 導入ガイド ----------------
     @app.api_route("/guide", methods=["GET", "HEAD"])

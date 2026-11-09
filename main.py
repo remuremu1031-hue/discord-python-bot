@@ -50,6 +50,20 @@ def _import_optional(name: str):
         except ModuleNotFoundError as e:
             if e.name not in (name, "cogs", f"cogs.{name}"):
                 raise  # ファイルはあるが、中で別のモジュールが足りない
+    # ファイル名の大文字・小文字が違う場合（Home.py など）も読み込む
+    import importlib.util
+    base = Path(__file__).resolve().parent
+    for folder in (base, base / "cogs"):
+        if not folder.is_dir():
+            continue
+        for p in folder.iterdir():
+            if p.suffix.lower() == ".py" and p.stem.lower() == name.lower():
+                spec = importlib.util.spec_from_file_location(name, p)
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[name] = mod
+                spec.loader.exec_module(mod)
+                print(f"✅ {p.name} を読み込みました（{folder.name}）")
+                return mod
     print(f"⚠️ {name}.py が見つかりません（main.py と同じ場所か cogs/ に置いてください）。この機能は無効になります。")
     return None
 
@@ -687,7 +701,7 @@ class TicketControlView(discord.ui.View):
 KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license", "gban", "set-log-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
-                 "nuke-whitelist", "subaccount", "transcript-channel", "help",
+                 "nuke-whitelist", "defense-exempt", "subaccount", "transcript-channel", "help",
                  "weather", "disaster", "sticky", "invite-stats", "invite-log", "invite-recount", "main-log", "rank", "leaderboard", "level",
                  "translate", "poll", "event", "faq", "say", "export-channel"}  # 残すスラッシュコマンド
 
@@ -973,6 +987,13 @@ class AuthBot(commands.Bot):
         例: "jma_alerts" → cogs/jma_alerts.py → jma_alerts.py の順に探す。"""
         candidates = [f"cogs.{name}", name] + [f"cogs.{a}" for a in COG_ALIASES.get(name, [])] \
             + COG_ALIASES.get(name, [])
+        # ファイル名の大文字・小文字が違う場合（Extras.py など）も候補にする
+        base = Path(__file__).resolve().parent
+        wanted = {n.lower() for n in [name] + COG_ALIASES.get(name, [])}
+        for folder, prefix in ((base / "cogs", "cogs."), (base, "")):
+            if folder.is_dir():
+                candidates += [prefix + p.stem for p in folder.glob("*.py") if p.stem.lower() in wanted
+                               and prefix + p.stem not in candidates]
         for ext in candidates:
             if importlib.util.find_spec(ext.split(".")[0]) is None:
                 continue  # そのフォルダ（cogs）自体が無い
@@ -1416,11 +1437,13 @@ async def on_audit_log_entry_create(entry: discord.AuditLogEntry):
     d = get_defense(guild.id)
     if uid in {int(x) for x in d.get("whitelist", [])} or bot.is_owner_id(uid):
         return
+    target_id = int(getattr(entry.target, "id", 0) or 0)
+    if nuke_is_exempt(guild, d, uid, kind, target_id):
+        return
     if kind == "prune":
         removed = int(getattr(entry.extra, "members_removed", 0) or 0)
         if removed < 10:
             return
-    target_id = int(getattr(entry.target, "id", 0) or 0)
     now = time.time()
     dq = _nuke_hits.setdefault((guild.id, uid, kind), deque(maxlen=100))
     dq.append((now, target_id))
@@ -1475,11 +1498,58 @@ async def on_guild_role_create(role: discord.Role):
                          "kind": "danger_role", "result": f"高権限ロール「{role.name}」が作成された"})
 
 
+def nuke_is_exempt(guild: discord.Guild, d: dict, uid: int, kind: str, target_id: int) -> bool:
+    """Nuke検知の除外設定（/defense-exempt）に当てはまるか。"""
+    if kind in set(d.get("nuke_exempt_kinds", [])):
+        return True  # この種類の操作は検知しない
+    member = guild.get_member(uid)
+    if member is not None:
+        if d.get("nuke_exempt_bots") and member.bot:
+            return True
+        roles = {int(x) for x in d.get("nuke_exempt_roles", [])}
+        if roles and any(r.id in roles for r in member.roles):
+            return True
+    chans = {int(x) for x in d.get("nuke_exempt_channels", [])}
+    if chans and kind in ("channel_delete", "channel_create") and target_id:
+        if target_id in chans:
+            return True
+        ch = guild.get_channel(target_id)
+        cat = getattr(ch, "category_id", None) if ch else None
+        if cat is None:  # 削除済みのチャンネルは、覚えておいた情報からカテゴリを調べる
+            saved = _deleted_channels.get(guild.id, {}).get(target_id)
+            cat = saved[1].get("category_id") if saved else None
+        if cat and int(cat) in chans:
+            return True
+    return False
+
+
+async def raid_is_exempt(member: discord.Member, d: dict) -> bool:
+    """Raid検知の除外設定（/defense-exempt）に当てはまるか。当てはまる参加は数えず、キックもしない。"""
+    if member.id in {int(x) for x in d.get("raid_exempt_users", [])}:
+        return True
+    days = int(d.get("raid_min_age_days", 0) or 0)
+    if days and (discord.utils.utcnow() - member.created_at).days >= days:
+        return True
+    codes = {str(c) for c in d.get("raid_exempt_invites", [])}
+    if codes and getattr(bot, "get_join_invite", None):
+        await asyncio.sleep(2)  # 招待リンクの特定を待つ
+        try:
+            inv = await bot.get_join_invite(member.guild.id, member.id)
+        except Exception:
+            inv = None
+        if inv and str(inv.get("code")) in codes:
+            return True
+    return False
+
+
 async def raid_check_join(member: discord.Member):
     """短時間の大量参加（Raid）を検知し、Raidモード中の参加者を自動でキックする。
     ※ SERVER MEMBERS INTENT（ENABLE_MEMBERS_INTENT=1）が必要。"""
     guild = member.guild
-    if member.bot or not get_defense(guild.id).get("raid_protection", False):
+    d = get_defense(guild.id)
+    if member.bot or not d.get("raid_protection", False):
+        return
+    if await raid_is_exempt(member, d):
         return
     now = time.time()
     if _raid_until.get(guild.id, 0) > now:
@@ -1586,7 +1656,8 @@ async def nuke_defense_cmd(interaction: discord.Interaction, nuke_defense: bool,
            f"・Raid自動検知: `{on(cur.get('raid_protection', False))}`"
            + ("" if ENABLE_MEMBERS_INTENT else "（※Bot側でメンバーIntentが無効のため動作しません）") + "\n"
            f"・自動招待リンクブロック: `{on(invite_block)}`\n"
-           f"・信頼済み（除外）ユーザー: {len(cur.get('whitelist', []))} 人（`/nuke-whitelist`）")
+           f"・信頼済み（除外）ユーザー: {len(cur.get('whitelist', []))} 人（`/nuke-whitelist`）\n"
+           f"・そのほかの除外設定は `/defense-exempt` で確認・変更できます")
     if missing:
         msg += "\n\n⚠️ Botに次の権限がありません: " + "、".join(missing)
     msg += "\n💡 Botのロールは、できるだけ一番上に置いてください（上位のロールを持つ荒らしは処罰できません）。"
@@ -1624,6 +1695,110 @@ async def nuke_whitelist_cmd(interaction: discord.Interaction, action: str, user
     await interaction.response.send_message(
         f"✅ {user.mention} を信頼済みユーザーから{'追加' if action == 'add' else '削除'}しました。",
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+NUKE_KIND_CHOICES = [app_commands.Choice(name=v, value=k) for k, v in NUKE_KIND_LABEL.items()]
+
+
+def defense_exempt_text(guild: discord.Guild, d: dict, target: str) -> str:
+    if target == "nuke":
+        lines = ["**🛡️ Nukeの除外設定**",
+                 "・ユーザー・BOT: " + (" ".join(f"<@{u}>" for u in d.get("whitelist", [])) or "なし"),
+                 "・ロール（持っている人は対象外）: " + (" ".join(f"<@&{r}>" for r in d.get("nuke_exempt_roles", [])) or "なし"),
+                 "・チャンネル・カテゴリ（作成・削除を数えない）: " + (" ".join(f"<#{c}>" for c in d.get("nuke_exempt_channels", [])) or "なし"),
+                 "・検知しない操作: " + ("、".join(NUKE_KIND_LABEL.get(k, k) for k in d.get("nuke_exempt_kinds", [])) or "なし"),
+                 f"・BOTの操作をすべて除外: `{'オン' if d.get('nuke_exempt_bots') else 'オフ'}`"]
+    else:
+        days = int(d.get("raid_min_age_days", 0) or 0)
+        lines = ["**🚧 Raidの除外設定**",
+                 "・ユーザー: " + (" ".join(f"<@{u}>" for u in d.get("raid_exempt_users", [])) or "なし"),
+                 "・招待リンク（このリンクからの参加は数えない）: " + (" ".join(f"`{c}`" for c in d.get("raid_exempt_invites", [])) or "なし"),
+                 f"・アカウント作成からの日数: " + (f"`{days}日以上` の人は数えない" if days else "制限なし")]
+    return "\n".join(lines)
+
+
+@bot.tree.command(name="defense-exempt", description="Nuke・Raid対策で反応しない対象（除外）を設定します")
+@app_commands.describe(target="NukeとRaidのどちらの設定か", action="追加 / 削除 / 一覧",
+                       user="除外するユーザー・BOT", role="このロールを持つ人の操作を除外（Nukeのみ）",
+                       channel="このチャンネル・カテゴリの作成・削除を数えない（Nukeのみ）",
+                       invite="この招待リンク（コードまたはURL）からの参加を数えない（Raidのみ）",
+                       nuke_kind="検知しない操作の種類（Nukeのみ）",
+                       bots="BOTの操作をすべて除外する（Nukeのみ）",
+                       min_age_days="アカウント作成からこの日数以上の人は数えない。0で解除（Raidのみ）")
+@app_commands.choices(target=[app_commands.Choice(name="Nuke（大量削除・大量BANなど）", value="nuke"),
+                              app_commands.Choice(name="Raid（大量参加）", value="raid")],
+                      action=[app_commands.Choice(name="追加 (add)", value="add"),
+                              app_commands.Choice(name="削除 (remove)", value="remove"),
+                              app_commands.Choice(name="一覧 (list)", value="list")],
+                      nuke_kind=NUKE_KIND_CHOICES)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def defense_exempt_cmd(interaction: discord.Interaction, target: str, action: str,
+                             user: discord.User | None = None, role: discord.Role | None = None,
+                             channel: discord.abc.GuildChannel | None = None, invite: str | None = None,
+                             nuke_kind: str | None = None, bots: bool | None = None,
+                             min_age_days: app_commands.Range[int, 0, 3650] | None = None):
+    guild = interaction.guild
+    if interaction.user.id != guild.owner_id and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
+        return
+    cfg = load_defense_config()
+    d = cfg.setdefault(str(guild.id), {})
+    none = discord.AllowedMentions.none()
+    if action == "list":
+        await interaction.response.send_message(defense_exempt_text(guild, d, target)[:1900], ephemeral=True,
+                                                allowed_mentions=none)
+        return
+    add = action == "add"
+    done, ng = [], []
+
+    def edit(key: str, value, label: str):
+        cur = list(d.get(key, []))
+        if add and value not in cur:
+            cur.append(value)
+        elif not add and value in cur:
+            cur.remove(value)
+        d[key] = cur[:200]
+        done.append(label)
+
+    if target == "nuke":
+        if user:
+            edit("whitelist", user.id, user.mention)
+        if role:
+            edit("nuke_exempt_roles", role.id, role.mention)
+        if channel:
+            edit("nuke_exempt_channels", channel.id, channel.mention)
+        if nuke_kind:
+            edit("nuke_exempt_kinds", nuke_kind, NUKE_KIND_LABEL.get(nuke_kind, nuke_kind))
+        if bots is not None:
+            d["nuke_exempt_bots"] = bots
+            done.append(f"BOTの除外を{'オン' if bots else 'オフ'}")
+        if invite or min_age_days is not None:
+            ng.append("招待リンク・日数はRaid用の設定です")
+    else:
+        if user:
+            edit("raid_exempt_users", user.id, user.mention)
+        if invite:
+            code = re.sub(r"^(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/", "", invite.strip()).strip("/ ")
+            if re.fullmatch(r"[A-Za-z0-9-]{2,32}", code):
+                edit("raid_exempt_invites", code, f"`{code}`")
+            else:
+                ng.append("招待リンクの形式が正しくありません")
+        if min_age_days is not None:
+            d["raid_min_age_days"] = int(min_age_days)
+            done.append(f"アカウント日数 {min_age_days}日" if min_age_days else "アカウント日数の制限を解除")
+        if role or channel or nuke_kind or bots is not None:
+            ng.append("ロール・チャンネル・操作の種類・BOTはNuke用の設定です")
+    if not done:
+        await interaction.response.send_message("❌ 変更する対象を指定してください。" + ("\n" + "\n".join(ng) if ng else ""),
+                                                ephemeral=True)
+        return
+    save_defense_config(cfg)
+    verb = "除外に追加" if add else "除外から削除"
+    await interaction.response.send_message(
+        f"✅ {'Nuke' if target == 'nuke' else 'Raid'}：{'、'.join(done)} を{verb}しました。"
+        + ("\n⚠️ " + "、".join(ng) if ng else "") + "\n\n" + defense_exempt_text(guild, d, target),
+        ephemeral=True, allowed_mentions=none)
 
 
 @bot.tree.command(name="backup", description="サーバーのロール・チャンネル構成のバックアップを作成・一覧・復元します")
@@ -3466,14 +3641,15 @@ QUERY_RULES: dict[str, dict[str, re.Pattern]] = {
 _fast_hits: dict[str, deque] = {}
 GUARD_POINTS.update({"scanner_strong": 6, "scanner_weak": 3, "injection": 6, "invalid_input": 2,
                      "bad_method": 2, "tool_ua": 3, "scanner_ua": 6, "machine_speed": 3,
-                     "command_injection": 2, "not_found": 1, "guild_forbidden": 3})
+                     "command_injection": 2, "not_found": 1, "guild_forbidden": 3, "home_forbidden": 3})
 GUARD_LABEL.update({"scanner_strong": "脆弱性スキャン（機密ファイル・パストラバーサル）",
                     "scanner_weak": "脆弱性スキャン（管理画面・スクリプトの探索）",
                     "injection": "攻撃コードの送信（SQL/OSコマンド/XSS 等）", "invalid_input": "不正な形式の入力",
                     "bad_method": "許可されていないHTTPメソッド", "tool_ua": "自動化ツールによる重要ページへのアクセス",
                     "scanner_ua": "攻撃ツール（スキャナー）の使用", "machine_speed": "機械的な高速リクエスト",
                     "command_injection": "コマンドへの攻撃コードの入力", "not_found": "存在しないページの総当たり",
-                    "guild_forbidden": "権限のないサーバー設定の操作"})
+                    "guild_forbidden": "権限のないサーバー設定の操作",
+                    "home_forbidden": "所有者以外によるお知らせの投稿"})
 
 
 def _plain_page(status: int, title: str, text: str) -> HTMLResponse:
@@ -4089,7 +4265,7 @@ async def index(request: Request, guild: int | None = None):
     if guild is None:
         # サーバー指定なしのアクセスは、公式サイトのトップページ（死活監視のpingにも200で応答）
         if home_site is not None:
-            return home_site.landing()
+            return await home_site.landing(request)
         return result_page(True, "霊夢BOT 稼働中",
                            "認証ページは、サーバー管理者が案内するURLからアクセスしてください。")
     if is_license_suspended(guild):
@@ -4434,7 +4610,11 @@ guild_dashboard_callback = None if guild_dashboard is None else guild_dashboard.
 # ---------- 公式サイト（/ ・ /guide ・ /demo ・ /status） ----------
 home_site = None if home is None else home.register(app, SimpleNamespace(
     bot=bot, client_id=CLIENT_ID, status_info=status_info, limiter=limiter,
-    invite_url=os.getenv("BOT_INVITE_URL") or None))
+    invite_url=os.getenv("BOT_INVITE_URL") or None,
+    owner_session=getattr(dashboard_callback, "current", None),  # 所有者ダッシュボードのログイン状態
+    load_updates=lambda: storage.load("home_updates", Path("home_updates.json")),
+    save_updates=lambda data: storage.save("home_updates", Path("home_updates.json"), data),
+    guard_web_strike=guard_web_strike))
 
 
 # ---------- Cloudflare クイックトンネル ----------
@@ -4522,6 +4702,7 @@ if __name__ == "__main__":
                          ("invite_log_config", Path("invite_log_config.json")),
                          ("level_config", Path("level_config.json")),
                          ("extras_config", Path("extras_config.json")),
+                         ("home_updates", Path("home_updates.json")),
                          ("extras_polls", Path("extras_polls.json")),
                          ("extras_events", Path("extras_events.json")),
                          ("extras_stats", Path("extras_stats.json")),
