@@ -344,7 +344,7 @@ def register(app, ctx) -> SimpleNamespace:
 <div><h4>リンク</h4><ul><li><a href="/guild-dashboard">ダッシュボード ↗</a></li><li><a href="/status">稼働状況 ↗</a></li>
 <li><a href="{SUPPORT_URL}" target="_blank" rel="noopener">サポート ↗</a></li></ul></div>
 <div><h4>規約</h4><ul><li><a href="/terms">利用規約</a></li><li><a href="/privacy">プライバシーポリシー</a></li></ul></div>
-</div><div class="copy"><span>© 霊夢BOT</span><span>Discord は Discord Inc. の商標です。本サービスは Discord Inc. とは関係ありません。</span></div></div></footer>
+</div><div class="copy"><span>© 霊夢BOT ・ <a href="/dashboard/login" style="color:var(--mut)">所有者ログイン</a></span><span>Discord は Discord Inc. の商標です。本サービスは Discord Inc. とは関係ありません。</span></div></div></footer>
 </body></html>"""
 
     # ---------------- トップページ ----------------
@@ -434,7 +434,7 @@ def register(app, ctx) -> SimpleNamespace:
 <div class="cta"><a class="btn pri" href="{inv}" target="_blank" rel="noopener">Discordに追加する ↗</a>
 <a class="btn ghost" href="{SUPPORT_URL}" target="_blank" rel="noopener">サポートサーバー ↗</a></div></div></div></section>"""
         r = respond(shell("霊夢BOT ｜ 守り、整え、語り合う。", body))
-        r.headers["Cache-Control"] = "no-store" if sess else "public, max-age=60"
+        r.headers["Cache-Control"] = "no-store" if sess else "private, no-cache"  # 古い画面が出ないように毎回確認
         return r
 
     # ---------------- お知らせの投稿・削除（所有者のみ） ----------------

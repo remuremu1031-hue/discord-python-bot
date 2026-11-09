@@ -4663,6 +4663,8 @@ dashboard_callback = None if dashboard is None else dashboard.register(app, Simp
     base_url=lambda: BASE_URL or f"http://localhost:{PORT}",  # クイックトンネルで後から変わるので関数で渡す
     oauth_redirect_uri=lambda: REDIRECT_URI,  # 認証と同じ /callback を使う（追加のRedirect登録は不要）
     get_owner_ids=bot.get_owner_ids, limiter=limiter, client_ip=client_ip,
+    load_sessions=lambda: storage.load("dash_sessions", Path("dash_sessions.json")),
+    save_sessions=lambda data: storage.save("dash_sessions", Path("dash_sessions.json"), data),
     send_security_alert=send_security_alert, log_buffer=LOG_BUFFER, boot_time=BOOT_TIME,
     storage_remote=storage.remote, redis_client=redis_client,
     load_auth_logs=load_auth_logs, load_incidents=load_incidents,
@@ -4842,6 +4844,7 @@ if __name__ == "__main__":
                          ("level_config", Path("level_config.json")),
                          ("extras_config", Path("extras_config.json")),
                          ("home_updates", Path("home_updates.json")),
+                         ("dash_sessions", Path("dash_sessions.json")),
                          ("ignore_channels", Path("ignore_channels.json")),
                          ("extras_polls", Path("extras_polls.json")),
                          ("extras_events", Path("extras_events.json")),

@@ -10,6 +10,7 @@ main.py から register(app, ctx) で登録する。このファイルは main.p
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import platform
@@ -28,7 +29,11 @@ JST = timezone(timedelta(hours=9))
 SESSION_COOKIE = "dash_session"
 STATE_COOKIE = "dash_state"
 SESSION_TTL = 12 * 3600
-_sessions: dict[str, dict] = {}
+_sessions: dict[str, dict] = {}  # キーはトークンのハッシュ（保存先に生のトークンを置かない）
+
+
+def _k(tok: str) -> str:
+    return hashlib.sha256(("dash-session:" + (tok or "")).encode()).hexdigest()
 _states: dict[str, float] = {}
 _used_states: dict[str, float] = {}  # 同じログインの使い回し防止
 
@@ -135,15 +140,42 @@ def register(app, ctx):
     def cookie_secure() -> bool:
         return ctx.base_url().startswith("https://")
 
+    def persist() -> None:
+        """ログイン状態を保存する（再起動・スリープ後もログインしたままにする）。"""
+        save = getattr(ctx, "save_sessions", None)
+        if save is None:
+            return
+        now = time.time()
+        for k in [k for k, v in _sessions.items() if v["exp"] < now]:
+            _sessions.pop(k, None)
+        try:
+            save({"s": _sessions})
+        except Exception as e:
+            print(f"ダッシュボードのログイン状態を保存できませんでした: {type(e).__name__}")
+
+    def drop(key: str) -> None:
+        if _sessions.pop(key, None) is not None:
+            persist()
+
     async def current(request: Request) -> dict | None:
         tok = request.cookies.get(SESSION_COOKIE)
-        sess = _sessions.get(tok or "")
+        if not tok:
+            return None
+        key = _k(tok)
+        sess = _sessions.get(key)
+        if sess is None and getattr(ctx, "load_sessions", None):
+            try:
+                sess = (ctx.load_sessions() or {}).get("s", {}).get(key)
+            except Exception:
+                sess = None
+            if sess:
+                _sessions[key] = sess
         if not sess or sess["exp"] < time.time():
-            _sessions.pop(tok or "", None)
+            drop(key)
             return None
         try:  # オーナーでなくなった場合（チーム移譲など）に備え、毎回確認する
             if sess["uid"] not in await ctx.get_owner_ids():
-                _sessions.pop(tok, None)
+                drop(key)
                 return None
         except Exception:
             return None
@@ -538,8 +570,9 @@ def register(app, ctx):
         tok = secrets.token_urlsafe(32)
         for k in [k for k, v in _sessions.items() if v["exp"] < time.time()]:
             _sessions.pop(k, None)
-        _sessions[tok] = {"uid": uid, "name": user.get("global_name") or user.get("username"),
+        _sessions[_k(tok)] = {"uid": uid, "name": user.get("global_name") or user.get("username"),
                           "avatar": av, "exp": time.time() + SESSION_TTL, "csrf": secrets.token_urlsafe(24)}
+        persist()
         print(f"ダッシュボードにログインしました（オーナー ID: {uid}）")
         resp = RedirectResponse("/dashboard", status_code=303)
         resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True, secure=cookie_secure(),
@@ -556,7 +589,7 @@ def register(app, ctx):
         sess = await current(request)
         f = await read_form(request)
         if sess and secrets.compare_digest(f.get("csrf", ""), sess["csrf"]):
-            _sessions.pop(request.cookies.get(SESSION_COOKIE, ""), None)
+            drop(_k(request.cookies.get(SESSION_COOKIE, "")))
         resp = RedirectResponse("/dashboard/login", status_code=303)
         resp.delete_cookie(SESSION_COOKIE, path="/")
         resp.delete_cookie(SESSION_COOKIE, path="/dashboard")  # 以前の設定で発行したもの
