@@ -582,6 +582,7 @@ def register(app, ctx):
                     ("inviteblock", "🔗", "招待リンクブロック", "他サーバーの招待リンクを自動でブロック", d.get("invite_block"), "both", "security", "admin", False),
                     ("spam", "🧹", "スパム対策", "連続投稿を自動削除して5分タイムアウト", am["spam"], "both", "automod", "admin", False),
                     ("amInvite", "✂️", "招待リンク削除", "招待リンクを含むメッセージを自動削除", am["invite"], "both", "automod", "admin", False),
+                    ("ignore", "🙈", "監視しないチャンネル", f"指定したチャンネルでは全機能を停止（{len(ctx.get_ignored_channels(gid))}件）", bool(ctx.get_ignored_channels(gid)), None, "security", "admin", False),
                     ("ocr", "🔍", "OCR画像検閲", "画像内の文字を読み取り、禁止ワードや招待リンクを検出" + xm("ocr")[1], xm("ocr")[0], "both", "security", "admin", False),
                 ]),
                 ("参加・認証", [
@@ -693,6 +694,16 @@ def register(app, ctx):
                 lbl("ユーザーID") + '<input type="text" name="uid" inputmode="numeric" maxlength="21" placeholder="例: 123456789012345678">'
                 + lbl("操作") + sel("mode", opt("add", "追加", "add") + opt("remove", "削除", "")), "実行", need="admin"), need="admin",
                 note="Nuke検知の対象外にするユーザー・BOTです。"))
+            # ---- 監視しないチャンネル（/ignore-channel） ----
+            ign = set(ctx.get_ignored_channels(gid))
+            ign_box = "".join(chk(f"c_{c.id}", c.id in ign, ("📁 " if str(getattr(c, "type", "")) == "category" else "#") + c.name)
+                              for c in sorted(guild.channels, key=lambda c: (c.position, c.id)))
+            ign_box += "".join(chk(f"c_{t}", True, f"🧵 スレッド {t}") for t in sorted(ign) if guild.get_channel(t) is None)
+            html_parts.append(card("🙈 監視しないチャンネル（/ignore-channel）", form("ignore_save",
+                '<div style="max-height:260px;overflow:auto;border:1px solid var(--line,#263243);border-radius:10px;padding:6px 10px">'
+                + ign_box + '</div>', "保存する", need="admin"), need="admin",
+                note="チェックしたチャンネル（カテゴリなら中のチャンネルすべて）では、霊夢BOTのすべての機能が止まります。"
+                     "メッセージ・リアクション・コマンド・ボタンに一切反応しません（/ignore-channel だけは、戻せるように使えます）。"))
             # ---- 除外設定（/defense-exempt） ----
             ex_roles = {int(x) for x in d.get("nuke_exempt_roles", [])}
             ex_chans = {int(x) for x in d.get("nuke_exempt_channels", [])}
@@ -912,7 +923,7 @@ def register(app, ctx):
 
     # ================= 保存 =================
     OP_NEED = {"auth_save": "admin", "panel_send": "admin", "logs_save": "manage_guild", "nuke_save": "admin",
-               "wl_edit": "admin", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
+               "wl_edit": "admin", "ignore_save": "admin", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
                "sticky_set": "manage_messages", "sticky_remove": "manage_messages", "weather_save": "manage_guild",
                "disaster_save": "manage_guild", "quake_save": "manage_guild", "eew_save": "manage_guild",
                "level_save": "manage_guild", "level_role": "manage_guild", "level_noxp": "manage_guild",
@@ -1084,6 +1095,12 @@ def register(app, ctx):
                 except Exception:
                     pass
             return "Nuke・Raid対策の設定を保存しました"
+        if op == "ignore_save":
+            valid = {c.id for c in guild.channels}
+            keep_threads = [t for t in ctx.get_ignored_channels(gid) if t not in valid and f.get(f"c_{t}") == "1"]
+            ids = [int(k[2:]) for k in f if k.startswith("c_") and k[2:].isdigit() and int(k[2:]) in valid] + keep_threads
+            ctx.set_ignored_channels(gid, ids)
+            return f"監視しないチャンネルを保存しました（{len(ids)}件）" if ids else "すべてのチャンネルを監視する設定にしました"
         if op == "nuke_exempt":
             dcfg = ctx.load_defense_config()
             d = dcfg.setdefault(str(gid), {})

@@ -413,6 +413,99 @@ def save_defense_config(data: dict) -> None:
     _defense_cache = (0.0, {})  # 次の参照で読み直す
 
 
+# ---------- 監視しないチャンネル（/ignore-channel） ----------
+IGNORE_CHANNELS_FILE = Path("ignore_channels.json")
+_ignore_cache: dict | None = None
+
+
+def load_ignored_channels() -> dict:
+    global _ignore_cache
+    if _ignore_cache is None:
+        _ignore_cache = storage.load("ignore_channels", IGNORE_CHANNELS_FILE)
+    return _ignore_cache
+
+
+def get_ignored_channels(guild_id: int) -> list[int]:
+    return [int(x) for x in load_ignored_channels().get(str(guild_id), [])]
+
+
+def set_ignored_channels(guild_id: int, ids: list[int]) -> None:
+    global _ignore_cache
+    data = storage.load("ignore_channels", IGNORE_CHANNELS_FILE)
+    if ids:
+        data[str(guild_id)] = sorted({int(x) for x in ids})[:200]
+    else:
+        data.pop(str(guild_id), None)
+    storage.save("ignore_channels", IGNORE_CHANNELS_FILE, data)
+    _ignore_cache = None
+
+
+def is_channel_ignored(guild_id: int | None, channel) -> bool:
+    """霊夢BOTの監視対象から外したチャンネルか。スレッドは親チャンネル、チャンネルはカテゴリも見る。"""
+    if not guild_id:
+        return False
+    ids = load_ignored_channels().get(str(guild_id))
+    if not ids:
+        return False
+    ids = {int(x) for x in ids}
+    if isinstance(channel, int):
+        g = bot.get_guild(guild_id)
+        channel = (g.get_channel_or_thread(channel) if g else None) or channel
+        if isinstance(channel, int):
+            return channel in ids
+    cid = getattr(channel, "id", None)
+    parent = getattr(channel, "parent", None)
+    for c in (channel, parent):
+        if c is None:
+            continue
+        if getattr(c, "id", None) in ids or getattr(c, "category_id", None) in ids:
+            return True
+    return cid in ids or getattr(channel, "parent_id", None) in ids
+
+
+# 監視しないチャンネルなら捨てるイベント（メッセージ・リアクション・入力中など、そのチャンネルで起きること全部）
+_IGNORE_EVENTS = {"message", "message_edit", "message_delete", "bulk_message_delete",
+                  "raw_message_delete", "raw_message_edit", "raw_bulk_message_delete",
+                  "reaction_add", "reaction_remove", "reaction_clear", "reaction_clear_emoji",
+                  "raw_reaction_add", "raw_reaction_remove", "raw_reaction_clear", "raw_reaction_clear_emoji",
+                  "typing", "raw_typing", "interaction"}
+IGNORED_CHANNEL_TEXT = "🙈 このチャンネルでは、霊夢BOTは停止しています。（管理者は `/ignore-channel` で戻せます）"
+
+
+def interaction_in_ignored_channel(interaction: discord.Interaction) -> bool:
+    """監視しないチャンネルでの操作か（/ignore-channel 自体は、戻せるように許可する）。"""
+    if not interaction.guild_id or not interaction.channel_id:
+        return False
+    cmd = interaction.data.get("name") if isinstance(interaction.data, dict) else None
+    if interaction.type == discord.InteractionType.application_command and cmd == "ignore-channel":
+        return False
+    ch = interaction.channel if interaction.channel is not None else interaction.channel_id
+    return is_channel_ignored(interaction.guild_id, ch)
+
+
+def _ignored_event(event_name: str, args) -> bool:
+    if event_name not in _IGNORE_EVENTS or not args:
+        return False
+    if event_name == "interaction":
+        return isinstance(args[0], discord.Interaction) and interaction_in_ignored_channel(args[0])
+    a = args[-1] if event_name == "message_edit" else args[0]
+    if isinstance(a, list):
+        a = a[0] if a else None
+    if a is None:
+        return False
+    if event_name.startswith("reaction_"):
+        a = getattr(a, "message", None)
+        if a is None:
+            return False
+    if event_name == "typing":  # (channel, user, when)
+        g = getattr(a, "guild", None)
+        return g is not None and is_channel_ignored(g.id, a)
+    if event_name.startswith("raw_"):
+        return is_channel_ignored(getattr(a, "guild_id", None), int(getattr(a, "channel_id", 0) or 0))
+    g = getattr(a, "guild", None)
+    return g is not None and is_channel_ignored(g.id, a.channel)
+
+
 def get_defense(guild_id: int) -> dict:
     """そのサーバーの防衛設定。メッセージごとに呼ばれるので、30秒キャッシュする。"""
     global _defense_cache
@@ -583,6 +676,9 @@ class LicenseTree(app_commands.CommandTree):
         if deny:
             await _deny_interaction(interaction, deny)
             return False
+        if interaction_in_ignored_channel(interaction):  # 監視しないチャンネルでは、コマンドも止める
+            await _deny_interaction(interaction, IGNORED_CHANNEL_TEXT)
+            return False
         gid = interaction.guild_id
         try:
             if gid is None or not is_license_suspended(gid):
@@ -701,7 +797,7 @@ class TicketControlView(discord.ui.View):
 KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license", "gban", "set-log-channel",
                  "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
-                 "nuke-whitelist", "defense-exempt", "subaccount", "transcript-channel", "help",
+                 "nuke-whitelist", "defense-exempt", "ignore-channel", "subaccount", "transcript-channel", "help",
                  "weather", "disaster", "sticky", "invite-stats", "invite-log", "invite-recount", "main-log", "rank", "leaderboard", "level",
                  "translate", "poll", "event", "faq", "say", "export-channel"}  # 残すスラッシュコマンド
 
@@ -843,6 +939,14 @@ class AuthBot(commands.Bot):
                     return
         except Exception:
             pass  # 判定できないときは、通常どおり処理する
+        try:  # 監視しないチャンネル（/ignore-channel）のメッセージは、自動モデレーション・ログ・レベル等に渡さない
+            if _ignored_event(event_name, args):
+                if event_name == "interaction" and args[0].type in (discord.InteractionType.component,
+                                                                    discord.InteractionType.modal_submit):
+                    asyncio.create_task(_deny_interaction(args[0], IGNORED_CHANNEL_TEXT))
+                return
+        except Exception:
+            pass
         super().dispatch(event_name, *args, **kwargs)
 
     def _reply_suspended(self, interaction) -> None:
@@ -879,6 +983,8 @@ class AuthBot(commands.Bot):
                         guard_blocked("user", inter.user.id) or is_user_blacklisted(inter.user.id)
                         or (inter.guild_id and is_license_suspended(inter.guild_id))):
                     return None  # 返信は dispatch("interaction") 側で行う
+                if inter is not None and interaction_in_ignored_channel(inter):
+                    return None  # 監視しないチャンネルのボタン・フォームも動かさない
                 return __orig(*a, **kw)
             setattr(store, name, gated)
 
@@ -1799,6 +1905,38 @@ async def defense_exempt_cmd(interaction: discord.Interaction, target: str, acti
         f"✅ {'Nuke' if target == 'nuke' else 'Raid'}：{'、'.join(done)} を{verb}しました。"
         + ("\n⚠️ " + "、".join(ng) if ng else "") + "\n\n" + defense_exempt_text(guild, d, target),
         ephemeral=True, allowed_mentions=none)
+
+
+@bot.tree.command(name="ignore-channel", description="指定したチャンネルを、霊夢BOTの監視対象から外します")
+@app_commands.describe(action="追加 / 削除 / 一覧", channel="対象のチャンネル・カテゴリ・スレッド（カテゴリなら中のチャンネル全部）")
+@app_commands.choices(action=[app_commands.Choice(name="監視から外す (add)", value="add"),
+                              app_commands.Choice(name="監視に戻す (remove)", value="remove"),
+                              app_commands.Choice(name="一覧 (list)", value="list")])
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def ignore_channel_cmd(interaction: discord.Interaction, action: str,
+                             channel: discord.abc.GuildChannel | discord.Thread | None = None):
+    guild = interaction.guild
+    if interaction.user.id != guild.owner_id and not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("管理者のみ実行できます。", ephemeral=True)
+        return
+    ids = get_ignored_channels(guild.id)
+    if action != "list":
+        if channel is None:
+            await interaction.response.send_message("`channel` を指定してください。", ephemeral=True)
+            return
+        if action == "add" and channel.id not in ids:
+            ids.append(channel.id)
+        elif action == "remove" and channel.id in ids:
+            ids.remove(channel.id)
+        set_ignored_channels(guild.id, ids)
+    text = "\n".join(f"・<#{c}>" for c in ids) or "なし（すべてのチャンネルを監視しています）"
+    head = "" if action == "list" else f"✅ {channel.mention} を監視{'から外しました' if action == 'add' else 'に戻しました'}。\n\n"
+    await interaction.response.send_message(
+        f"{head}🙈 **監視しないチャンネル**（{len(ids)}件）\n{text}\n\n"
+        "-# これらのチャンネルでは、霊夢BOTはすべての機能を停止します（メッセージ・リアクション・コマンド・ボタンに反応しません）。"
+        "戻すときは、別のチャンネルかダッシュボードから操作してください（このコマンドだけはどこでも使えます）。"[:1900],
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="backup", description="サーバーのロール・チャンネル構成のバックアップを作成・一覧・復元します")
@@ -4604,6 +4742,7 @@ guild_dashboard_callback = None if guild_dashboard is None else guild_dashboard.
     load_backups=load_backups, restore_backup=restore_backup,
     get_main_log_channel_id=get_main_log_channel_id, set_main_log_channel_id=set_main_log_channel_id,
     del_log_channel_id=del_log_channel_id,
+    get_ignored_channels=get_ignored_channels, set_ignored_channels=set_ignored_channels,
 ))
 
 
@@ -4703,6 +4842,7 @@ if __name__ == "__main__":
                          ("level_config", Path("level_config.json")),
                          ("extras_config", Path("extras_config.json")),
                          ("home_updates", Path("home_updates.json")),
+                         ("ignore_channels", Path("ignore_channels.json")),
                          ("extras_polls", Path("extras_polls.json")),
                          ("extras_events", Path("extras_events.json")),
                          ("extras_stats", Path("extras_stats.json")),
