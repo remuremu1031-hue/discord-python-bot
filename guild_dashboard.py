@@ -846,6 +846,9 @@ def register(app, ctx):
                 lbl("送信先") + sel("channel", channel_options(guild, None)), "パネルを送信", need="admin"), need="admin",
                 note="トランスクリプトの送信先は「ログ・通知」タブで設定できます。"))
         elif tab == "moderation":
+            pg = b_cog("Purge")
+            if pg is not None:
+                html_parts.append(pg.render_card(guild, H))
             html_parts.append(card("🔨 メンバーへの処分", form("mod_action",
                 lbl("対象のユーザーID") + '<input type="text" name="uid" inputmode="numeric" maxlength="21">'
                 + lbl("操作") + sel("action", opt("timeout", "タイムアウト", "timeout") + opt("untimeout", "タイムアウト解除", "")
@@ -969,7 +972,7 @@ def register(app, ctx):
 
     # ================= 保存 =================
     OP_NEED = {"auth_save": "admin", "panel_send": "admin", "logs_save": "manage_guild", "nuke_save": "admin",
-               "wl_edit": "admin", "ignore_save": "admin", "rec_save": "admin", "rec_stop": "admin", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
+               "wl_edit": "admin", "ignore_save": "admin", "rec_save": "admin", "rec_stop": "admin", "purge_run": "manage_messages", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
                "sticky_set": "manage_messages", "sticky_remove": "manage_messages", "weather_save": "manage_guild",
                "disaster_save": "manage_guild", "quake_save": "manage_guild", "eew_save": "manage_guild",
                "level_save": "manage_guild", "level_role": "manage_guild", "level_noxp": "manage_guild",
@@ -1006,7 +1009,13 @@ def register(app, ctx):
             return forbidden(request, sess, f"{op} を権限なしで実行しようとした")
         gid = guild.id
         try:
-            if op in ("rec_save", "rec_stop"):
+            if op == "purge_run":
+                pg = b_cog("Purge")
+                if pg is None:
+                    raise ValueError("メッセージ削除（purge.py）が読み込まれていません")
+                P = SimpleNamespace(pick_channel=lambda raw, required=False: pick_channel(guild, raw, required=required))
+                done = await pg.dashboard_op(f, guild, member, P)
+            elif op in ("rec_save", "rec_stop"):
                 rec = b_cog("Recorder")
                 if rec is None:
                     raise ValueError("録音機能（recorder.py）が読み込まれていません")

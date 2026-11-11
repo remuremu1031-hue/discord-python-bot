@@ -807,7 +807,7 @@ class TicketControlView(discord.ui.View):
 KEEP_COMMANDS = {
     "help",
     # モデレーション
-    "warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban",
+    "warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "purge",
     # イベント・アンケート・FAQ・録音・翻訳
     "event", "poll", "faq", "record", "translate",
     # レベル・招待（見るだけ）
@@ -819,7 +819,7 @@ KEEP_COMMANDS = {
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
               "event_logs", "moderation", "automod",
-              "jma_alerts", "help", "sticky", "invite_tracker", "levels", "extras", "recorder"]  # cogs/ フォルダの追加機能
+              "jma_alerts", "help", "sticky", "invite_tracker", "levels", "extras", "recorder", "purge"]  # cogs/ フォルダの追加機能
 
 # ファイル名の別名（例: reaction_role.py でも reaction_roles として読み込む）
 COG_ALIASES = {"reaction_roles": ["reaction_role"], "event_logs": ["event_log"],
