@@ -10,7 +10,7 @@ CATEGORIES = [
     ("🎉 イベント・アンケート", ["event", "poll"]),
     ("🧰 便利機能", ["faq", "record", "translate", "invite-stats", "help"]),
     ("📈 レベル・ランク", ["rank", "leaderboard"]),
-    ("👑 オーナー専用", ["broadcast", "blacklist", "license", "gban"]),
+    ("👑 オーナー専用", ["broadcast", "blacklist", "license", "gban", "code-integrity"]),
 ]
 OWNER_CAT = "👑 オーナー専用"
 GUIDE = {

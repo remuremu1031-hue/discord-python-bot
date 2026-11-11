@@ -28,8 +28,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 JST = timezone(timedelta(hours=9))
 SESSION_COOKIE = "dash_session"
 STATE_COOKIE = "dash_state"
-SESSION_TTL = 12 * 3600
+SESSION_TTL = 6 * 3600  # 所有者のログインは6時間で切れる
 _sessions: dict[str, dict] = {}  # キーはトークンのハッシュ（保存先に生のトークンを置かない）
+
+
+def _ua_hash(request) -> str:
+    return hashlib.sha256(("ua:" + (request.headers.get("user-agent") or "")).encode()).hexdigest()[:16]
 
 
 def _k(tok: str) -> str:
@@ -172,6 +176,13 @@ def register(app, ctx):
                 _sessions[key] = sess
         if not sess or sess["exp"] < time.time():
             drop(key)
+            return None
+        # ログインしたときと違うブラウザから使われたら（Cookieを盗まれた可能性）、そのセッションを無効にする
+        if sess.get("ua") and sess["ua"] != _ua_hash(request):
+            drop(key)
+            asyncio.create_task(ctx.send_security_alert(
+                "所有者セッションの不正使用", "ログインしたときと違うブラウザから、所有者のログイン情報が使われました。セッションを無効にしました",
+                request, level="critical", dedupe_key=f"dash-ua:{key[:12]}"))
             return None
         try:  # オーナーでなくなった場合（チーム移譲など）に備え、毎回確認する
             if sess["uid"] not in await ctx.get_owner_ids():
@@ -571,8 +582,12 @@ def register(app, ctx):
         for k in [k for k, v in _sessions.items() if v["exp"] < time.time()]:
             _sessions.pop(k, None)
         _sessions[_k(tok)] = {"uid": uid, "name": user.get("global_name") or user.get("username"),
-                          "avatar": av, "exp": time.time() + SESSION_TTL, "csrf": secrets.token_urlsafe(24)}
+                          "avatar": av, "exp": time.time() + SESSION_TTL, "csrf": secrets.token_urlsafe(24),
+                          "ua": _ua_hash(request), "at": int(time.time())}
         persist()
+        notify = getattr(ctx, "notify_owner_login", None)
+        if notify:  # 所有者にログインを知らせる（心当たりがなければ、全員ログアウトできる）
+            asyncio.create_task(notify(_sessions[_k(tok)]["name"], request))
         print(f"ダッシュボードにログインしました（オーナー ID: {uid}）")
         resp = RedirectResponse("/dashboard", status_code=303)
         resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True, secure=cookie_secure(),
@@ -700,4 +715,14 @@ def register(app, ctx):
         return _secure_headers(resp)
 
     dashboard_callback.current = current  # 公式サイトから「所有者としてログイン中か」を調べる窓口
+
+    def logout_all() -> int:
+        n = len(_sessions)
+        _sessions.clear()
+        persist()
+        save = getattr(ctx, "save_sessions", None)
+        if save:
+            save({"s": {}})
+        return n
+    dashboard_callback.logout_all = logout_all  # 所有者のDMの「全員ログアウト」ボタンから使う
     return dashboard_callback

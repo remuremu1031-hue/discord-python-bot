@@ -8,6 +8,7 @@ import importlib.util
 import io
 import ipaddress
 import json
+from urllib.parse import urlsplit
 import logging
 import math
 import os
@@ -676,6 +677,9 @@ class LicenseTree(app_commands.CommandTree):
         if deny:
             await _deny_interaction(interaction, deny)
             return False
+        if code_is_locked() and interaction.user.id not in (bot._owner_ids or set()):
+            await _deny_interaction(interaction, "🔒 現在メンテナンス中のため、霊夢BOTは停止しています。")
+            return False
         if interaction_in_ignored_channel(interaction):  # 監視しないチャンネルでは、コマンドも止める
             await _deny_interaction(interaction, IGNORED_CHANNEL_TEXT)
             return False
@@ -804,7 +808,7 @@ KEEP_COMMANDS = {
     # レベル・招待（見るだけ）
     "rank", "leaderboard", "invite-stats",
     # Botの所有者専用
-    "broadcast", "blacklist", "license", "gban",
+    "broadcast", "blacklist", "license", "gban", "code-integrity",
 }
 
 
@@ -945,6 +949,13 @@ class AuthBot(commands.Bot):
                     return
         except Exception:
             pass  # 判定できないときは、通常どおり処理する
+        try:  # 改ざんの疑い（CODE_LOCK）で止めている間は、所有者の操作以外は処理しない
+            if code_is_locked() and event_name not in ("ready", "connect", "disconnect", "resumed", "shard_ready",
+                                                      "shard_connect", "shard_resumed", "socket_event_type"):
+                if event_name != "interaction" or not args or args[0].user.id not in (self._owner_ids or set()):
+                    return
+        except Exception:
+            pass
         try:  # 監視しないチャンネル（/ignore-channel）のメッセージは、自動モデレーション・ログ・レベル等に渡さない
             if _ignored_event(event_name, args):
                 if event_name == "interaction" and args[0].type in (discord.InteractionType.component,
@@ -1163,6 +1174,11 @@ class AuthBot(commands.Bot):
             self.refresh_status.start()
         if not self.auto_backup.is_running():
             self.auto_backup.start()
+        if not getattr(self, "_integrity_started", False):  # プログラムの改ざん検知
+            self._integrity_started = True
+            _code_state["boot"] = code_fingerprints()
+            await code_integrity_check("起動時")
+            self.loop.create_task(code_integrity_watch())
 
         # 起動時に1回だけ、不要な古いスラッシュコマンド（例: /veryfi-panel）を削除する
         if not PURGE_OLD_COMMANDS or getattr(self, "_purged", False):
@@ -1408,6 +1424,113 @@ async def send_admin_alert(guild: discord.Guild, embed: discord.Embed) -> bool:
             except discord.HTTPException:
                 continue
     return False
+
+
+# ---------- プログラムの改ざん検知 ----------
+# 起動時と5分ごとに、Botのプログラム（.py・requirements.txt）の指紋（SHA-256）を取り、
+# 所有者が承認した状態と比べる。違えば所有者にDMで知らせ、承認ボタンを付ける。
+# 環境変数 CODE_LOCK=1 のときは、承認されるまで Bot の機能（認証・ダッシュボード・コマンド等）を止める。
+CODE_LOCK = os.getenv("CODE_LOCK", "0") == "1"
+INTEGRITY_FILE = Path("code_integrity.json")
+_code_state = {"locked": False, "boot": {}, "pending": None, "checked": 0.0}
+
+
+def code_fingerprints() -> dict[str, str]:
+    base = Path(__file__).resolve().parent
+    out = {}
+    for folder in (base, base / "cogs"):
+        if not folder.is_dir():
+            continue
+        for p in sorted(folder.iterdir()):
+            if p.is_file() and (p.suffix == ".py" or p.name == "requirements.txt"):
+                try:
+                    out[str(p.relative_to(base))] = hashlib.sha256(p.read_bytes()).hexdigest()
+                except OSError:
+                    pass
+    return out
+
+
+def code_digest(fp: dict[str, str]) -> str:
+    return hashlib.sha256(json.dumps(fp, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def code_diff(old: dict, new: dict) -> tuple[list, list, list]:
+    added = sorted(set(new) - set(old))
+    removed = sorted(set(old) - set(new))
+    changed = sorted(k for k in set(old) & set(new) if old[k] != new[k])
+    return added, changed, removed
+
+
+def code_is_locked() -> bool:
+    return CODE_LOCK and _code_state["locked"]
+
+
+class CodeApproveView(discord.ui.View):
+    def __init__(self, digest: str):
+        super().__init__(timeout=None)
+        self.add_item(discord.ui.Button(label="この変更を承認する", emoji="✅", style=discord.ButtonStyle.success,
+                                        custom_id=f"xcode:approve:{digest}"))
+
+
+async def code_integrity_check(reason: str) -> None:
+    """プログラムの指紋を、承認済みのものと比べる。"""
+    fp = code_fingerprints()
+    digest = code_digest(fp)
+    data = storage.load("code_integrity", INTEGRITY_FILE)
+    trusted = data.get("trusted")
+    _code_state["checked"] = time.time()
+    if not trusted:  # 初めて → 今の状態を承認済みとして記録
+        data.update({"trusted": fp, "digest": digest, "approved_at": int(time.time()), "approved_by": "初回起動"})
+        storage.save("code_integrity", INTEGRITY_FILE, data)
+        print(f"🔏 プログラムの指紋を記録しました（{len(fp)}ファイル・{digest}）")
+        return
+    if data.get("digest") == digest:
+        _code_state.update(pending=None, locked=False)
+        return
+    added, changed, removed = code_diff(trusted, fp)
+    if _code_state.get("pending") == digest:
+        return  # 同じ変更はすでに知らせている
+    _code_state["pending"] = digest
+    _code_state["locked"] = True
+    lines = ([f"➕ {x}" for x in added] + [f"✏️ {x}" for x in changed] + [f"➖ {x}" for x in removed])[:25]
+    commit = os.getenv("RENDER_GIT_COMMIT", "")[:12]
+    print(f"⚠️ プログラムの変更を検知（{reason}）: " + ", ".join(lines)[:500])
+    e = discord.Embed(title="🔏 プログラムの変更を検知しました", color=0xF1C40F if reason == "起動時" else 0xE74C3C,
+                      description=(f"検知: **{reason}**" + (f"\nデプロイ: `{commit}`" if commit else "") + "\n\n"
+                                   + "\n".join(lines) + "\n\n"
+                                   + ("あなたが更新したものなら「承認する」を押してください。\n"
+                                      "**心当たりがない場合は承認せず**、GitHub と Render のパスワード変更・"
+                                      "Discord Bot のトークン再発行をしてください。")
+                                   + ("\n\n🔒 承認されるまで、Botの機能を止めています（CODE_LOCK）。" if CODE_LOCK else "")))
+    if reason != "起動時":
+        e.add_field(name="⚠️ 稼働中の書き換え", value="Botの動作中にファイルが書き換えられました。通常の更新では起きません。不正アクセスの可能性が高いです。",
+                    inline=False)
+    try:
+        owner_ids = await bot.get_owner_ids()
+    except Exception:
+        owner_ids = set()
+    for oid in owner_ids:
+        try:
+            user = bot.get_user(oid) or await bot.fetch_user(oid)
+            await user.send(embed=e, view=CodeApproveView(digest))
+        except Exception as ex:
+            print(f"オーナーへのDM送信に失敗: {safe_error(ex)}")
+    fire_and_forget(send_security_alert("プログラムの変更を検知", f"{reason}: " + ", ".join(lines)[:300],
+                                        level="critical" if reason != "起動時" else "warning",
+                                        dedupe_key=f"code:{digest}"))
+
+
+async def code_integrity_approve(uid: int, digest: str) -> str:
+    fp = code_fingerprints()
+    now_digest = code_digest(fp)
+    if now_digest != digest:
+        return "⚠️ このあとにも変更があったため、承認できません。新しい通知のボタンを押してください。"
+    data = storage.load("code_integrity", INTEGRITY_FILE)
+    data.update({"trusted": fp, "digest": digest, "approved_at": int(time.time()), "approved_by": str(uid)})
+    storage.save("code_integrity", INTEGRITY_FILE, data)
+    _code_state.update(pending=None, locked=False, boot=fp)
+    print(f"🔏 プログラムの変更を承認しました（{digest}・承認者 {uid}）")
+    return f"✅ 承認しました（{digest}）。" + ("Botの機能を再開しました。" if CODE_LOCK else "")
 
 
 async def dm_owners(embed: discord.Embed, *, dedupe: str | None = None, cooldown: float = 30) -> None:
@@ -1914,6 +2037,89 @@ async def defense_exempt_cmd(interaction: discord.Interaction, target: str, acti
         f"✅ {'Nuke' if target == 'nuke' else 'Raid'}：{'、'.join(done)} を{verb}しました。"
         + ("\n⚠️ " + "、".join(ng) if ng else "") + "\n\n" + defense_exempt_text(guild, d, target),
         ephemeral=True, allowed_mentions=none)
+
+
+async def notify_owner_login(name: str, request: Request) -> None:
+    """所有者ダッシュボードへのログインを、所有者にDMで知らせる。"""
+    ua = (request.headers.get("user-agent") or "不明")[:120]
+    ident = (guard_web_id(request) or "")[:10]
+    e = discord.Embed(title="🔑 所有者ダッシュボードにログインしました", color=0x3B82F6,
+                      description=(f"アカウント: **{discord.utils.escape_markdown(name or '')}**\n"
+                                   f"日時: <t:{int(time.time())}:f>\n接続元（ハッシュ）: `{ident or '不明'}`\n端末: `{ua}`\n\n"
+                                   "心当たりがない場合は、下のボタンですべてのログインを切ってから、"
+                                   "Discordのパスワードを変更してください。"))
+    try:
+        owner_ids = await bot.get_owner_ids()
+    except Exception:
+        return
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="すべてのログインを切る", emoji="🚪", style=discord.ButtonStyle.danger,
+                                    custom_id="xsec:logout_all"))
+    for oid in owner_ids:
+        try:
+            user = bot.get_user(oid) or await bot.fetch_user(oid)
+            await user.send(embed=e, view=view)
+        except Exception as ex:
+            print(f"オーナーへのDM送信に失敗: {safe_error(ex)}")
+
+
+@bot.listen("on_interaction")
+async def _logout_all_button(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+    if (interaction.data or {}).get("custom_id") != "xsec:logout_all":
+        return
+    if interaction.user.id not in await bot.get_owner_ids():
+        await interaction.response.send_message("Botの所有者だけが使えます。", ephemeral=True)
+        return
+    fn = getattr(dashboard_callback, "logout_all", None) if dashboard_callback else None
+    n = fn() if fn else 0
+    await interaction.response.send_message(f"🚪 所有者ダッシュボードのログインをすべて切りました（{n}件）。", ephemeral=True)
+
+
+async def code_integrity_watch():
+    """動作中のファイルの書き換え（サーバーへの侵入）を、5分ごとに確認する。"""
+    while not bot.is_closed():
+        await asyncio.sleep(300)
+        try:
+            if code_fingerprints() != _code_state.get("boot"):
+                await code_integrity_check("稼働中")
+        except Exception as e:
+            print(f"改ざん検知でエラー: {safe_error(e)}")
+
+
+@bot.listen("on_interaction")
+async def _code_approve_button(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+    cid = (interaction.data or {}).get("custom_id", "")
+    if not cid.startswith("xcode:approve:"):
+        return
+    if interaction.user.id not in await bot.get_owner_ids():
+        await interaction.response.send_message("Botの所有者だけが承認できます。", ephemeral=True)
+        return
+    msg = await code_integrity_approve(interaction.user.id, cid.split(":", 2)[2][:32])
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+@bot.tree.command(name="code-integrity", description="【オーナー専用】プログラムの改ざん検知の状態を表示します")
+async def code_integrity_cmd(interaction: discord.Interaction):
+    if interaction.user.id not in await bot.get_owner_ids():
+        await interaction.response.send_message("Botの所有者だけが使えます。", ephemeral=True)
+        return
+    data = storage.load("code_integrity", INTEGRITY_FILE)
+    fp = code_fingerprints()
+    digest = code_digest(fp)
+    ok = data.get("digest") == digest
+    when = data.get("approved_at")
+    text = (f"{'✅ 承認済みの状態です' if ok else '⚠️ 未承認の変更があります'}\n"
+            f"・現在: `{digest}`（{len(fp)}ファイル）\n・承認済み: `{data.get('digest', '-')}`"
+            + (f"（<t:{when}:f>）" if when else "") + f"\n・機能の停止（CODE_LOCK）: {'オン' if CODE_LOCK else 'オフ'}")
+    if not ok and data.get("trusted"):
+        a, c, r = code_diff(data["trusted"], fp)
+        text += "\n\n" + "\n".join(([f"➕ {x}" for x in a] + [f"✏️ {x}" for x in c] + [f"➖ {x}" for x in r])[:20])
+    await interaction.response.send_message(text[:1900], ephemeral=True,
+                                            view=None if ok else CodeApproveView(digest))
 
 
 @bot.tree.command(name="ignore-channel", description="指定したチャンネルを、霊夢BOTの監視対象から外します")
@@ -3591,15 +3797,16 @@ GUARD_POINTS = {
     # Web
     "suspicious_path": 2, "rate_limit": 2, "bad_state": 1, "dashboard_denied": 6, "bad_dashboard_csrf": 3,
     # Bot
-    "owner_command": 2, "interaction_flood": 6, "blacklisted_use": 0,
+    "owner_command": 2, "interaction_flood": 6, "blacklisted_use": 0, "csrf": 4,
 }
 GUARD_LABEL = {
     "suspicious_path": "脆弱性を探す不審なパスへのアクセス", "rate_limit": "レート制限の超過",
     "bad_state": "不正・期限切れの認証セッション", "dashboard_denied": "ダッシュボードへの不正ログイン",
     "bad_dashboard_csrf": "ダッシュボードへの偽装リクエスト",
     "owner_command": "オーナー専用コマンドの不正使用", "interaction_flood": "コマンド・ボタンの連打（スパム）",
+    "csrf": "他のサイトからの偽装送信（CSRF）",
 }
-OWNER_ONLY_COMMANDS = {"gban", "broadcast", "blacklist", "license"}
+OWNER_ONLY_COMMANDS = {"gban", "broadcast", "blacklist", "license", "code-integrity"}
 INTERACTION_FLOOD = (int(os.getenv("GUARD_FLOOD_COUNT", "12")), 10)  # 10秒に12回を超えたら連打
 _guard_points: dict[str, deque] = {}
 _guard_inter: dict[int, deque] = {}
@@ -3816,6 +4023,11 @@ def _security_headers(resp, request: Request):
     h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
     h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    h.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    h.setdefault("X-Permitted-Cross-Domain-Policies", "none")
+    h.setdefault("Origin-Agent-Cluster", "?1")
+    if "server" in h:
+        del h["server"]  # 使っているサーバーソフトを明かさない
     if BASE_URL.startswith("https://"):
         h.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     return resp
@@ -3890,6 +4102,18 @@ async def guard_middleware(request: Request, call_next):
     # 6) POSTの本文は大きさだけ確認（中身はダッシュボード側で項目ごとに形式を検証している）
     if request.method == "POST" and int(request.headers.get("content-length") or 0) > 20000:
         return stop("invalid_input", 413, "リクエストが大きすぎます", "このリクエストは受け付けられません。")
+    # 7) 他のサイトから送られてきたフォーム（CSRF）を拒否する。ブラウザは POST に必ず Origin を付ける
+    if request.method == "POST" and path != "/youtube/websub":
+        origin = request.headers.get("origin") or ""
+        u = urlsplit(BASE_URL) if BASE_URL else None
+        if origin and u and u.netloc and origin.rstrip("/").lower() != f"{u.scheme}://{u.netloc}".lower():
+            return stop("csrf", 403, "このページからは送信できません",
+                        "別のサイトから送られたリクエストのため、受け付けませんでした。", detail=f"Origin: {origin[:80]}")
+    # 8) 改ざんの疑いで止めている間は、認証・ダッシュボードを使わせない（盗まれたコードに情報を渡さない）
+    if code_is_locked() and (path.startswith(("/callback", "/guild-dashboard", "/home/")) or path == "/"
+                             and request.query_params.get("guild")):
+        return _security_headers(_plain_page(503, "メンテナンス中です",
+                                             "安全確認のため、一時的に停止しています。しばらくしてからお試しください。"), request)
     resp = await call_next(request)
     return _security_headers(resp, request)
 
@@ -4676,6 +4900,7 @@ dashboard_callback = None if dashboard is None else dashboard.register(app, Simp
     base_url=lambda: BASE_URL or f"http://localhost:{PORT}",  # クイックトンネルで後から変わるので関数で渡す
     oauth_redirect_uri=lambda: REDIRECT_URI,  # 認証と同じ /callback を使う（追加のRedirect登録は不要）
     get_owner_ids=bot.get_owner_ids, limiter=limiter, client_ip=client_ip,
+    notify_owner_login=lambda name, request: notify_owner_login(name, request),
     load_sessions=lambda: storage.load("dash_sessions", Path("dash_sessions.json")),
     save_sessions=lambda data: storage.save("dash_sessions", Path("dash_sessions.json"), data),
     send_security_alert=send_security_alert, log_buffer=LOG_BUFFER, boot_time=BOOT_TIME,
@@ -4860,6 +5085,7 @@ if __name__ == "__main__":
                          ("home_updates", Path("home_updates.json")),
                          ("dash_sessions", Path("dash_sessions.json")),
                          ("ignore_channels", Path("ignore_channels.json")),
+                         ("code_integrity", Path("code_integrity.json")),
                          ("extras_polls", Path("extras_polls.json")),
                          ("extras_events", Path("extras_events.json")),
                          ("extras_stats", Path("extras_stats.json")),
