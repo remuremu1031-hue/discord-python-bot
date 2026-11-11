@@ -1658,4 +1658,9 @@ def register(app, ctx):
             return f"@{role.name} の一斉付与を開始しました（完了するとログチャンネルに記録されます）"
         raise ValueError("不明な操作です")
 
+    def logout_all() -> int:  # 緊急時に、サーバー管理ダッシュボードのログインをすべて切る
+        n = len(_sessions)
+        _sessions.clear()
+        return n
+    gd_callback.logout_all = logout_all
     return gd_callback

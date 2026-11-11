@@ -677,6 +677,11 @@ class LicenseTree(app_commands.CommandTree):
         if deny:
             await _deny_interaction(interaction, deny)
             return False
+        cmd_name = interaction.data.get("name") if isinstance(interaction.data, dict) else None
+        if (cmd_name in OWNER_ONLY_COMMANDS and cmd_name != "code-integrity" and owner_areas_closed()):
+            await _deny_interaction(interaction, "🔒 安全のため、所有者専用コマンドを一時的に止めています。"
+                                                 "DMの通知（または /code-integrity）から対応してください。")
+            return False
         if code_is_locked() and interaction.user.id not in (bot._owner_ids or set()):
             await _deny_interaction(interaction, "🔒 現在メンテナンス中のため、霊夢BOTは停止しています。")
             return False
@@ -1461,8 +1466,103 @@ def code_diff(old: dict, new: dict) -> tuple[list, list, list]:
     return added, changed, removed
 
 
+# ---------- 緊急措置（所有者がすぐ対応できなくても、Botが自動で守る） ----------
+# full   : Botの機能をすべて止める（動作中のファイル書き換え＝侵入を検知したとき）
+# owner  : 所有者用の強い機能だけ止める（未承認のプログラム変更・攻撃の集中を検知したとき）
+#          → 所有者ダッシュボード・お知らせ投稿・/gban /broadcast /license /blacklist
+EMERGENCY_FILE = Path("emergency_state.json")
+_attack_blocks: deque = deque()
+ATTACK_WAVE = (int(os.getenv("ATTACK_WAVE_BLOCKS", "5")), 600)  # 10分で5件の自動ブロック → 攻撃の集中
+
+
+_emg_cache: dict | None = None
+
+
+def emergency_state() -> dict:
+    global _emg_cache
+    if _emg_cache is None:  # すべてのイベントで確認するので、メモリに置いておく
+        _emg_cache = storage.load("emergency_state", EMERGENCY_FILE)
+    return _emg_cache
+
+
+def _emg_save(data: dict) -> None:
+    global _emg_cache
+    storage.save("emergency_state", EMERGENCY_FILE, data)
+    _emg_cache = None
+
+
+def emergency_active(level: str) -> dict | None:
+    st = emergency_state().get(level)
+    if not st:
+        return None
+    if st.get("until") and st["until"] < time.time():
+        return None
+    return st
+
+
+def emergency_set(level: str, reason: str, minutes: int | None = None) -> bool:
+    """緊急措置をかける。新しくかかったときだけ True。"""
+    data = emergency_state()
+    cur = data.get(level)
+    if cur and (not cur.get("until") or cur["until"] > time.time()):
+        return False
+    data = dict(data)
+    data[level] = {"reason": reason, "at": int(time.time()),
+                   "until": int(time.time() + minutes * 60) if minutes else 0}
+    _emg_save(data)
+    print(f"🚨 緊急措置（{level}）: {reason}")
+    return True
+
+
+def emergency_clear(level: str | None = None) -> None:
+    data = dict(emergency_state())
+    for lv in ([level] if level else ["full", "owner"]):
+        data.pop(lv, None)
+    _emg_save(data)
+
+
+def revoke_all_sessions() -> str:
+    """ダッシュボード（所有者・サーバー管理）のログインをすべて切る。"""
+    n1 = n2 = 0
+    try:
+        n1 = dashboard_callback.logout_all() if dashboard_callback and hasattr(dashboard_callback, "logout_all") else 0
+    except Exception:
+        pass
+    try:
+        n2 = guild_dashboard_callback.logout_all() if guild_dashboard_callback and hasattr(guild_dashboard_callback, "logout_all") else 0
+    except Exception:
+        pass
+    return f"所有者 {n1}件・サーバー管理 {n2}件"
+
+
+async def emergency_notify(title: str, text: str, *, critical: bool = True) -> None:
+    e = discord.Embed(title=title, description=text[:3900], color=0xEF4444 if critical else 0xF59E0B,
+                      timestamp=datetime.now(timezone.utc))
+    await dm_owners(e, dedupe=f"emg:{title}", cooldown=60)
+    fire_and_forget(send_security_alert(title, text[:300], level="critical" if critical else "warning",
+                                        dedupe_key=f"emg:{title}"))
+
+
+def note_auto_block() -> None:
+    """自動ブロックが短時間に集中したら（攻撃の集中）、所有者用の機能を30分閉じる。"""
+    now = time.time()
+    _attack_blocks.append(now)
+    while _attack_blocks and now - _attack_blocks[0] > ATTACK_WAVE[1]:
+        _attack_blocks.popleft()
+    if len(_attack_blocks) >= ATTACK_WAVE[0] and emergency_set("owner", "不正アクセスが集中しているため", 30):
+        fire_and_forget(emergency_notify(
+            "🚨 攻撃の集中を検知 → 所有者用の機能を30分閉じました",
+            f"10分間に {len(_attack_blocks)} 件の自動ブロックがありました。\n"
+            "念のため、所有者ダッシュボード・お知らせ投稿・所有者専用コマンドを30分間閉じています。"
+            "30分たつと自動で元に戻ります（何もしなくて大丈夫です）。", critical=False))
+
+
 def code_is_locked() -> bool:
-    return CODE_LOCK and _code_state["locked"]
+    return (CODE_LOCK and _code_state["locked"]) or emergency_active("full") is not None
+
+
+def owner_areas_closed() -> dict | None:
+    return emergency_active("full") or emergency_active("owner")
 
 
 class CodeApproveView(discord.ui.View):
@@ -1486,12 +1586,42 @@ async def code_integrity_check(reason: str) -> None:
         return
     if data.get("digest") == digest:
         _code_state.update(pending=None, locked=False)
+        st = emergency_active("full")
+        if reason == "起動時" and st and st.get("tamper"):  # 侵入後の再起動で、きれいなプログラムに戻った
+            emergency_clear("full")
+            await emergency_notify("✅ 自動で復旧しました",
+                                   "書き換えられたファイルは再起動で元に戻り、承認済みのプログラムと一致しました。Botの機能を再開しています。\n"
+                                   "念のため、GitHub・Render・Discord のパスワード変更とBotトークンの再発行をおすすめします。",
+                                   critical=False)
+        st = emergency_active("owner")
+        if st and st.get("code"):  # 未承認の変更による保護モードは、承認済みの状態に戻れば解除
+            emergency_clear("owner")
         return
     added, changed, removed = code_diff(trusted, fp)
     if _code_state.get("pending") == digest:
         return  # 同じ変更はすでに知らせている
     _code_state["pending"] = digest
     _code_state["locked"] = True
+    if reason == "起動時":
+        # 未承認の変更：所有者用の強い機能だけ、承認されるまで自動で閉じる（一般の機能は動かしたまま）
+        if emergency_set("owner", "未承認のプログラム変更があるため"):
+            d = dict(emergency_state())
+            d["owner"] = dict(d["owner"], code=True)
+            _emg_save(d)
+    else:
+        # 動作中の書き換え＝サーバーへの侵入：すべて止め、ログインを切り、きれいな状態で再起動する
+        emergency_set("full", "動作中にプログラムが書き換えられたため（侵入の疑い）")
+        d = dict(emergency_state())
+        d["full"] = dict(d["full"], tamper=True)
+        _emg_save(d)
+        revoked = revoke_all_sessions()
+        await emergency_notify(
+            "🚨 侵入を検知 → Botを緊急停止しました",
+            "Botの動作中にプログラムが書き換えられました。自動で次の措置をとりました。\n"
+            f"・Botの機能（認証・コマンド・ダッシュボード）を停止\n・ダッシュボードのログインをすべて切断（{revoked}）\n"
+            "・書き換えを消すため、20秒後に自動で再起動\n\n"
+            "再起動後、承認済みのプログラムと一致すれば自動で復旧します。一致しなければ停止したままにします。")
+        bot.loop.call_later(20, lambda: os._exit(3))  # Render が自動で起動し直す（ファイルはデプロイ時の状態に戻る）
     lines = ([f"➕ {x}" for x in added] + [f"✏️ {x}" for x in changed] + [f"➖ {x}" for x in removed])[:25]
     commit = os.getenv("RENDER_GIT_COMMIT", "")[:12]
     print(f"⚠️ プログラムの変更を検知（{reason}）: " + ", ".join(lines)[:500])
@@ -1529,6 +1659,7 @@ async def code_integrity_approve(uid: int, digest: str) -> str:
     data.update({"trusted": fp, "digest": digest, "approved_at": int(time.time()), "approved_by": str(uid)})
     storage.save("code_integrity", INTEGRITY_FILE, data)
     _code_state.update(pending=None, locked=False, boot=fp)
+    emergency_clear()  # 承認したら、緊急措置もすべて解除
     print(f"🔏 プログラムの変更を承認しました（{digest}・承認者 {uid}）")
     return f"✅ 承認しました（{digest}）。" + ("Botの機能を再開しました。" if CODE_LOCK else "")
 
@@ -2093,10 +2224,17 @@ async def _code_approve_button(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component:
         return
     cid = (interaction.data or {}).get("custom_id", "")
-    if not cid.startswith("xcode:approve:"):
+    if not cid.startswith("xcode:"):
         return
     if interaction.user.id not in await bot.get_owner_ids():
         await interaction.response.send_message("Botの所有者だけが承認できます。", ephemeral=True)
+        return
+    if cid == "xcode:clear":
+        if code_digest(code_fingerprints()) != storage.load("code_integrity", INTEGRITY_FILE).get("digest"):
+            await interaction.response.send_message("⚠️ 未承認のプログラム変更があるため、先に承認してください。", ephemeral=True)
+            return
+        emergency_clear()
+        await interaction.response.send_message("🔓 緊急措置を解除しました。", ephemeral=True)
         return
     msg = await code_integrity_approve(interaction.user.id, cid.split(":", 2)[2][:32])
     await interaction.response.send_message(msg, ephemeral=True)
@@ -2115,11 +2253,19 @@ async def code_integrity_cmd(interaction: discord.Interaction):
     text = (f"{'✅ 承認済みの状態です' if ok else '⚠️ 未承認の変更があります'}\n"
             f"・現在: `{digest}`（{len(fp)}ファイル）\n・承認済み: `{data.get('digest', '-')}`"
             + (f"（<t:{when}:f>）" if when else "") + f"\n・機能の停止（CODE_LOCK）: {'オン' if CODE_LOCK else 'オフ'}")
+    emg = [(lv, st) for lv in ("full", "owner") if (st := emergency_active(lv))]
+    for lv, st in emg:
+        text += (f"\n🚨 緊急措置（{'全機能の停止' if lv == 'full' else '所有者用の機能を閉鎖'}）: {st.get('reason')}"
+                 + (f"・<t:{st['until']}:R>に自動解除" if st.get("until") else ""))
     if not ok and data.get("trusted"):
         a, c, r = code_diff(data["trusted"], fp)
         text += "\n\n" + "\n".join(([f"➕ {x}" for x in a] + [f"✏️ {x}" for x in c] + [f"➖ {x}" for x in r])[:20])
-    await interaction.response.send_message(text[:1900], ephemeral=True,
-                                            view=None if ok else CodeApproveView(digest))
+    view = None if ok else CodeApproveView(digest)
+    if ok and emg:
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label="緊急措置を解除する", emoji="🔓", style=discord.ButtonStyle.secondary,
+                                        custom_id="xcode:clear"))
+    await interaction.response.send_message(text[:1900], ephemeral=True, view=view)
 
 
 @bot.tree.command(name="ignore-channel", description="指定したチャンネルを、霊夢BOTの監視対象から外します")
@@ -3881,6 +4027,7 @@ async def _guard_block(kind: str, ident: str, reasons: list[str], detail: str, r
     d[kind][ident] = {"until": int(time.time() + dur), "count": count, "reason": "、".join(reasons),
                       "at": datetime.now(JST).strftime("%Y-%m-%d %H:%M"), "detail": detail[:200]}
     storage.save("security_blocks", SEC_BLOCK_FILE, d)
+    note_auto_block()
     span = f"{dur // 86400}日" if dur >= 86400 else (f"{dur // 3600}時間" if dur >= 3600 else f"{dur // 60}分")
     who = f"<@{ident}>（`{ident}`）" if kind == "user" else f"接続元 `{ident[:10]}`"
     print(f"🧱 自動ブロック: {kind} {ident[:10]} / {span} / {'、'.join(reasons)}")
@@ -4109,6 +4256,12 @@ async def guard_middleware(request: Request, call_next):
         if origin and u and u.netloc and origin.rstrip("/").lower() != f"{u.scheme}://{u.netloc}".lower():
             return stop("csrf", 403, "このページからは送信できません",
                         "別のサイトから送られたリクエストのため、受け付けませんでした。", detail=f"Origin: {origin[:80]}")
+    # 8a) 緊急措置中は、所有者用のページを閉じる
+    if (path == "/dashboard" or path.startswith("/dashboard/") or path == "/home/updates") and owner_areas_closed():
+        st = owner_areas_closed() or {}
+        return _security_headers(_plain_page(503, "安全のため一時的に閉じています",
+                                             f"理由: {st.get('reason', '安全確認')}。自動で元に戻ります。"
+                                             "Botの所有者は、DMに届いた通知から対応できます。"), request)
     # 8) 改ざんの疑いで止めている間は、認証・ダッシュボードを使わせない（盗まれたコードに情報を渡さない）
     if code_is_locked() and (path.startswith(("/callback", "/guild-dashboard", "/home/")) or path == "/"
                              and request.query_params.get("guild")):
@@ -5086,6 +5239,7 @@ if __name__ == "__main__":
                          ("dash_sessions", Path("dash_sessions.json")),
                          ("ignore_channels", Path("ignore_channels.json")),
                          ("code_integrity", Path("code_integrity.json")),
+                         ("emergency_state", Path("emergency_state.json")),
                          ("extras_polls", Path("extras_polls.json")),
                          ("extras_events", Path("extras_events.json")),
                          ("extras_stats", Path("extras_stats.json")),
