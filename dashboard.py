@@ -97,7 +97,7 @@ def _secure_headers(resp: Response) -> Response:
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Referrer-Policy"] = "same-origin"  # 外のサイトには送らない（送信元の確認のため、同じサイト内では送る）
     resp.headers["Content-Security-Policy"] = (
         "default-src 'none'; style-src 'unsafe-inline'; img-src https://cdn.discordapp.com data:; "
         "form-action 'self'; base-uri 'none'; frame-ancestors 'none'")

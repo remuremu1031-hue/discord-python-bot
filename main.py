@@ -1600,6 +1600,10 @@ async def code_integrity_check(reason: str) -> None:
     added, changed, removed = code_diff(trusted, fp)
     if _code_state.get("pending") == digest:
         return  # 同じ変更はすでに知らせている
+    already = data.get("notified") == digest and reason == "起動時"  # 再起動（スリープ復帰）のたびに同じDMを送らない
+    if not already:
+        data["notified"] = digest
+        storage.save("code_integrity", INTEGRITY_FILE, data)
     _code_state["pending"] = digest
     _code_state["locked"] = True
     if reason == "起動時":
@@ -1623,6 +1627,9 @@ async def code_integrity_check(reason: str) -> None:
             "再起動後、承認済みのプログラムと一致すれば自動で復旧します。一致しなければ停止したままにします。")
         bot.loop.call_later(20, lambda: os._exit(3))  # Render が自動で起動し直す（ファイルはデプロイ時の状態に戻る）
     lines = ([f"➕ {x}" for x in added] + [f"✏️ {x}" for x in changed] + [f"➖ {x}" for x in removed])[:25]
+    if already:
+        print(f"⚠️ 未承認のプログラム変更が続いています（{digest}）。/code-integrity から承認できます")
+        return
     commit = os.getenv("RENDER_GIT_COMMIT", "")[:12]
     print(f"⚠️ プログラムの変更を検知（{reason}）: " + ", ".join(lines)[:500])
     e = discord.Embed(title="🔏 プログラムの変更を検知しました", color=0xF1C40F if reason == "起動時" else 0xE74C3C,
@@ -4252,8 +4259,15 @@ async def guard_middleware(request: Request, call_next):
     # 7) 他のサイトから送られてきたフォーム（CSRF）を拒否する。ブラウザは POST に必ず Origin を付ける
     if request.method == "POST" and path != "/youtube/websub":
         origin = request.headers.get("origin") or ""
+        # 自分のサイト（設定のURL・実際にアクセスされたホスト）以外からの送信だけを拒否する。
+        # "null" はブラウザが送信元を伏せたとき（古いページなど）。各フォームの CSRF トークンで守られているので通す
         u = urlsplit(BASE_URL) if BASE_URL else None
-        if origin and u and u.netloc and origin.rstrip("/").lower() != f"{u.scheme}://{u.netloc}".lower():
+        own = {f"{u.scheme}://{u.netloc}".lower()} if u and u.netloc else set()
+        host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip().lower()
+        if host:
+            own |= {f"https://{host}", f"http://{host}"}
+        o = origin.rstrip("/").lower()
+        if origin and o != "null" and own and o not in own:
             return stop("csrf", 403, "このページからは送信できません",
                         "別のサイトから送られたリクエストのため、受け付けませんでした。", detail=f"Origin: {origin[:80]}")
     # 8a) 緊急措置中は、所有者用のページを閉じる
