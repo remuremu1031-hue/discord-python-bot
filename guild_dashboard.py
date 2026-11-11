@@ -149,6 +149,15 @@ align-items:center;justify-content:center;font-size:14px;flex:none}
 80%{opacity:1;transform:translate(-50%,0)}100%{opacity:0;transform:translate(-50%,8px);visibility:hidden}}
 @media (prefers-reduced-motion:reduce){.toast{animation:toast-fade 3.6s steps(1) forwards}}
 @keyframes toast-fade{0%{opacity:1}100%{opacity:0;visibility:hidden}}
+/* 「設定を開く」や保存のあと、そのカードの位置に戻る（上のヘッダー・タブに隠れないよう余白をとる） */
+.card[id]{scroll-margin-top:130px}
+.card:target{border-color:rgba(59,130,246,.7);box-shadow:0 0 0 3px rgba(59,130,246,.25);animation:hl 2.4s ease forwards}
+@keyframes hl{0%,60%{box-shadow:0 0 0 4px rgba(59,130,246,.35)}100%{box-shadow:none;border-color:var(--line)}}
+/* エラーも、画面のどこにいても見えるように下に出す（エラーは消さずに残す） */
+.toast.ng{border-color:rgba(239,68,68,.55);box-shadow:0 12px 32px rgba(0,0,0,.5),0 0 0 4px rgba(239,68,68,.15);
+animation:toast-in .3s ease forwards;pointer-events:auto}
+.toast.ng .tick{background:#ef4444}
+@keyframes toast-in{0%{opacity:0;transform:translate(-50%,16px)}100%{opacity:1;transform:translate(-50%,0)}}
 """
 
 
@@ -404,6 +413,25 @@ def register(app, ctx):
             ("roles", "🎭 ロール"), ("sticky", "📌 案内の固定"), ("alerts", "🌦️ 天気・災害"), ("levels", "📈 レベル"),
             ("events", "🎉 イベント・投票"), ("tools", "🧰 便利ツール"), ("media", "📺 配信・VC")]
     EXT_TABS = ("events", "tools", "media")
+
+    def card_id(title: str) -> str:
+        """カードの見出しから、ページ内リンク用の目印を作る。"""
+        return "c-" + hashlib.sha1(title.encode()).hexdigest()[:10]
+
+    # モジュール一覧の「設定を開く」で移動する先のカード
+    MOD_CARD = {
+        "nuke": "🛡️ Nuke・Raid対策", "raid": "🛡️ Nuke・Raid対策", "inviteblock": "🛡️ Nuke・Raid対策",
+        "spam": "🧹 自動モデレーション", "amInvite": "🧹 自動モデレーション", "ignore": "🙈 監視しないチャンネル",
+        "ocr": "🔍 OCR画像検閲（Google Vision）", "auth": "🔐 認証の設定", "subaccount": "🔐 認証の設定",
+        "invites": "📝 個別のログチャンネル", "levels": "📈 レベル機能", "roles": "🎭 ロールメニュー（複数選択）",
+        "sticky": "📌 案内メッセージの固定", "events": "🎉 イベントを作成", "polls": "📊 アンケート・日程調整を作成",
+        "faq": "❓ FAQ（よくある質問）", "weather": "🗾 天気予報の自動投稿", "disaster": "🌊 津波・火山・気象警報",
+        "eew": "🚨 緊急地震速報", "eventlog": "📋 イベントログ", "youtube": "📺 YouTube Push",
+        "automsg": "⏰ 自動メッセージ", "report": "📊 週次レポート", "mainlog": "🗂️ メインログ（すべてのログ）",
+        "tickets": "🎫 チケット", "moderation": "🔨 メンバーへの処分", "backup": "💾 バックアップ",
+        "logs": "📝 個別のログチャンネル", "translate": "🌐 翻訳（DeepL）", "threads": "🧵 スレッド管理",
+        "say": "📣 代理送信", "vclink": "🎧 VC連動公開", "html": "📄 チャンネルHTML保存", "recording": "🎙️ 録音",
+    }
     KIND_LABEL = {"channel_delete": "チャンネルの大量削除", "channel_create": "チャンネルの大量作成",
                   "role_delete": "ロールの大量削除", "role_create": "ロールの大量作成", "ban": "連続BAN",
                   "kick": "連続キック", "webhook_create": "Webhookの大量作成", "prune": "メンバーの一括削除（Prune）"}
@@ -519,7 +547,11 @@ def register(app, ctx):
             locked = not perms[need]
             lock_note = {"admin": "「管理者」権限", "manage_guild": "「サーバー管理」権限",
                          "manage_messages": "「メッセージの管理」権限", "moderate": "「メンバーをタイムアウト」権限"}[need]
-            return (f'<div class="card{" lock" if locked else ""}" style="margin-bottom:12px"><h2 style="margin-top:0">{title}</h2>'
+            cid = card_id(title)
+            # 保存したあと、このカードの位置に戻ってこられるように、フォームにカードの目印を入れる
+            body = re.sub(r'(<form method="post" action="/guild-dashboard/save"[^>]*>)',
+                          lambda m: m.group(1) + f'<input type="hidden" name="_a" value="{cid}">', body)
+            return (f'<div class="card{" lock" if locked else ""}" id="{cid}" style="margin-bottom:12px"><h2 style="margin-top:0">{title}</h2>'
                     + (f'<div class="flash">🔒 この設定の変更には{lock_note}が必要です</div>' if locked else "")
                     + (f'<p class="mut">{note}</p>' if note else "") + body + "</div>")
 
@@ -622,7 +654,7 @@ def register(app, ctx):
                     ("logs", "📝", "個別のログ", "セキュリティ・トランスクリプト・招待ログを、メインログとは別のチャンネルへ", bool(inv_log) or bool(ctx.get_transcript_channel_id(gid)), None, "logs", "manage_guild", False),
                     ("translate", "🌐", "翻訳", "国旗リアクションや指定チャンネルで自動翻訳（DeepL）" + xm("translate")[1], xm("translate")[0], "both", "tools", "manage_guild", False),
                     ("threads", "🧵", "スレッド管理", "指定チャンネルの投稿に自動でスレッドを作成", xm("threads")[0], "both", "tools", "manage_guild", False),
-                    ("say", "📣", "代理送信", "テキスト・埋め込み・Webhookで、Botから送信（メンションは任意）", ext is not None, None, "tools", "manage_guild", False),
+                    ("say", "📣", "代理送信", "テキスト・埋め込み・Webhookで、Botから送信（メンションは任意）", ext is not None, None, "media", "manage_guild", False),
                     ("vclink", "🎧", "VC連動公開", "VCに参加中の人だけに聞き専チャンネルを表示" + xm("vclink")[1], xm("vclink")[0], "both", "media", "admin", False),
                     ("html", "📄", "チャンネルHTML保存", "チャンネルの会話をHTMLファイルとしてダウンロード", ext is not None, None, "media", "admin", False),
                     ("recording", "🎙️", "録音", "VCを話した人ごとに録音し、ZIPで送信" + rec_state[1], rec_state[0], "both", "media", "admin", False),
@@ -638,12 +670,15 @@ def register(app, ctx):
                         sw = (f'<form method="post" action="/guild-dashboard/save"><input type="hidden" name="csrf" value="{_e(sess["csrf"])}">'
                               f'<input type="hidden" name="guild" value="{gid}"><input type="hidden" name="tab" value="modules">'
                               f'<input type="hidden" name="op" value="module_toggle"><input type="hidden" name="key" value="{key}">'
+                              f'<input type="hidden" name="_a" value="m-{key}">'
                               f'<input type="hidden" name="to" value="{"0" if on else "1"}">'
                               f'<button class="switch{" on" if on else ""}" title="{"無効にする" if on else "有効にする"}" '
                               f'aria-label="{_e(name)}を{"無効" if on else "有効"}にする"{dis}></button></form>')
                     href = f'/guild-dashboard?{httpx.QueryParams({"guild": str(gid), "tab": link})}'
+                    if key in MOD_CARD:  # 開いたときに、その設定の場所まで移動する
+                        href += "#" + card_id(MOD_CARD[key])
                     cards.append(
-                        f'<div class="card mod{" wide" if wide else ""}"><div class="top"><div class="g" style="gap:12px">'
+                        f'<div class="card mod{" wide" if wide else ""}" id="m-{key}"><div class="top"><div class="g" style="gap:12px">'
                         f'<div class="ic">{ic}</div><div class="name">{_e(name)}</div></div>{sw}</div>'
                         f'<div class="desc">{_e(desc)}</div><div class="foot">'
                         f'<span class="badge{" on" if on else ""}">{"有効" if on else "無効"}</span>'
@@ -654,7 +689,7 @@ def register(app, ctx):
 
             cfg = ctx.load_config().get(str(gid)) or {}
             sub = ctx.get_subaccount_action(gid)
-            html_parts.append(card("🔐 認証の設定（/setup・/subaccount）", form("auth_save",
+            html_parts.append(card("🔐 認証の設定", form("auth_save",
                 lbl("認証後に付与するロール") + sel("role_id", role_options(guild, member, cfg.get("role_id")))
                 + '<div class="mut">Botより下・あなたより下で、強い権限を持たないロールだけ選べます</div>'
                 + lbl("認証ログを送るチャンネル") + sel("auth_log", channel_options(guild, cfg.get("log_channel_id")))
@@ -662,7 +697,7 @@ def register(app, ctx):
                 + sel("subaccount", opt("block", "認証を拒否する", sub) + opt("log", "認証は通し、ログに記録するだけ", sub)),
                 "保存する", need="admin"), need="admin"))
             if cfg:
-                html_parts.append(card("📨 認証パネル（/panel・/authlink）", f'<p class="mut">認証ページ: <code>{_e(ctx.auth_url(gid))}</code></p>'
+                html_parts.append(card("📨 認証パネル", f'<p class="mut">認証ページ: <code>{_e(ctx.auth_url(gid))}</code></p>'
                     + form("panel_send", lbl("認証パネルを送信するチャンネル") + sel("channel", channel_options(guild, None)),
                            "認証パネルを送信", need="admin"), need="admin"))
         elif tab == "logs":
@@ -811,7 +846,7 @@ def register(app, ctx):
                 lbl("送信先") + sel("channel", channel_options(guild, None)), "パネルを送信", need="admin"), need="admin",
                 note="トランスクリプトの送信先は「ログ・通知」タブで設定できます。"))
         elif tab == "moderation":
-            html_parts.append(card("🔨 メンバーへの処分（/timeout・/untimeout・/kick・/ban・/unban）", form("mod_action",
+            html_parts.append(card("🔨 メンバーへの処分", form("mod_action",
                 lbl("対象のユーザーID") + '<input type="text" name="uid" inputmode="numeric" maxlength="21">'
                 + lbl("操作") + sel("action", opt("timeout", "タイムアウト", "timeout") + opt("untimeout", "タイムアウト解除", "")
                                    + opt("kick", "キック", "") + opt("ban", "BAN", "") + opt("unban", "BAN解除", ""))
@@ -827,7 +862,7 @@ def register(app, ctx):
                 warn_html = f'<p><b><code>{_e(wq)}</code> の警告: {len(rows)} 回</b></p>' + "".join(
                     f'<div class="mut">・{_e(r.get("at", ""))} {_e(r.get("reason", ""))}（実行: <code>{_e(r.get("by"))}</code>）</div>'
                     for r in reversed(rows[-15:]))
-            html_parts.append(card("⚠️ 警告（/warn・/warnings・/clearwarnings）",
+            html_parts.append(card("⚠️ 警告",
                 f'<form method="get" action="/guild-dashboard"><input type="hidden" name="guild" value="{gid}">'
                 f'<input type="hidden" name="tab" value="moderation"><label>警告を確認するユーザーID</label>'
                 f'<input type="text" name="q" inputmode="numeric" maxlength="21" value="{_e(wq)}">'
@@ -862,7 +897,7 @@ def register(app, ctx):
                     + "、".join("@" + _e(getattr(guild.get_role(r["id"]), "name", "?")) for r in p.get("roles", []))
                     + (f' → 送信済み #{_e(getattr(guild.get_channel(p.get("c") or 0), "name", "?"))}' if p.get("m") else " （未送信）") + "</div>"
                     for pid, p in menus.items()) or '<div class="mut">ロールメニューはありません</div>'
-                html_parts.append(card("🎭 ロールメニュー（複数選択・/reactionrole menu-*）", mlist
+                html_parts.append(card("🎭 ロールメニュー（複数選択）", mlist
                     + form("rr_create", lbl("新しいメニューのタイトル") + '<input type="text" name="title" maxlength="100">'
                            + lbl("説明文（任意）") + '<input type="text" name="description" maxlength="1500">', "メニューを作成", need="admin")
                     + (form("rr_edit", lbl("メニュー") + sel("menu", mopts)
@@ -879,7 +914,7 @@ def register(app, ctx):
                 elist = "".join(f'<div class="mut">・{_e(k.split(":", 1)[1] if not k.split(":", 1)[1].isdigit() else "カスタム絵文字")} → '
                                 f'@{_e(getattr(guild.get_role(v.get("r", 0)), "name", "?"))}（メッセージ <code>{_e(k.split(":", 1)[0])}</code>）</div>'
                                 for k, v in emap.items()) or '<div class="mut">設定はありません</div>'
-                html_parts.append(card("😀 絵文字リアクション方式（/reactionrole add・remove）", elist
+                html_parts.append(card("😀 絵文字リアクション方式", elist
                     + '<p class="mut">追加・削除は、メッセージに絵文字を付ける操作が必要なため、スラッシュコマンドで行ってください。</p>', need="admin"))
             html_parts.append(card("🏷️ 一斉ロール付与", form("mass_role",
                 lbl("全員に付与するロール") + sel("role", role_options(guild, member, None))
@@ -919,8 +954,9 @@ def register(app, ctx):
         icon = (f'<img src="{_e(guild.icon.replace(size=128).url)}" alt="">' if guild.icon else f'<div class="ph">{_e(guild.name[:1])}</div>')
         if not msg:
             flash = ""
-        elif is_ng:
-            flash = f'<div class="flash ng">{_e(msg)}</div>'
+        elif is_ng:  # エラーは画面下に出したまま（保存した場所から動かないので、上に出すと見えない）
+            flash = (f'<div class="flash ng">{_e(msg)}</div>'
+                     f'<div class="toast ng" role="alert"><span class="tick">!</span><span>{_e(msg.removeprefix("⚠️").strip())}</span></div>')
         else:  # 保存できたときは、画面下に数秒だけ表示して消える（スクリプトなし・CSSのアニメーションだけ）
             flash = (f'<div class="toast" role="status"><span class="tick">✓</span>'
                      f'<span>{_e(msg.removeprefix("✅").strip())}</span></div>')
@@ -995,7 +1031,9 @@ def register(app, ctx):
             done, ok = str(e), False
         msg = ("✅ " + (done or "変更はありませんでした")) if ok else ("⚠️ " + done)
         q = httpx.QueryParams({"guild": str(gid), "tab": tab, "msg": msg[:280], **({} if ok else {"ng": "1"})})
-        return _headers(RedirectResponse(f"/guild-dashboard?{q}", status_code=303))
+        anchor = f.get("_a", "")
+        frag = f"#{anchor}" if re.fullmatch(r"(c-[0-9a-f]{10}|m-[A-Za-z]{1,20})", anchor) else ""
+        return _headers(RedirectResponse(f"/guild-dashboard?{q}{frag}", status_code=303))
 
     def pick_channel(guild, raw, *, attach=False, required=False, voice=False):
         if not raw:
