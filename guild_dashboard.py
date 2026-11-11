@@ -430,7 +430,7 @@ def register(app, ctx):
         "automsg": "⏰ 自動メッセージ", "report": "📊 週次レポート", "mainlog": "🗂️ メインログ（すべてのログ）",
         "tickets": "🎫 チケット", "moderation": "🔨 メンバーへの処分", "backup": "💾 バックアップ",
         "logs": "📝 個別のログチャンネル", "translate": "🌐 翻訳（DeepL）", "threads": "🧵 スレッド管理",
-        "say": "📣 代理送信", "vclink": "🎧 VC連動公開", "html": "📄 チャンネルHTML保存", "recording": "🎙️ 録音",
+        "say": "📣 代理送信", "lockdown": "🔒 ロックダウン", "quarantine": "🚧 新規アカウントの隔離", "tempvc": "➕ 一時VC", "vclink": "🎧 VC連動公開", "html": "📄 チャンネルHTML保存", "recording": "🎙️ 録音",
     }
     KIND_LABEL = {"channel_delete": "チャンネルの大量削除", "channel_create": "チャンネルの大量作成",
                   "role_delete": "ロールの大量削除", "role_create": "ロールの大量作成", "ban": "連続BAN",
@@ -584,6 +584,12 @@ def register(app, ctx):
         ext = b_cog("Extras")
         xs = ext.module_states(gid) if ext is not None else {}
 
+        stc_cog = b_cog("ServerTools")
+        sts = stc_cog.module_states(gid) if stc_cog is not None else {}
+
+        def sm(key):
+            return sts.get(key, (False, "（未導入）"))
+
         rec_cog = b_cog("Recorder")
         rec_state = rec_cog.module_state(gid) if rec_cog is not None else (False, "（未導入）")
 
@@ -617,6 +623,8 @@ def register(app, ctx):
                     ("inviteblock", "🔗", "招待リンクブロック", "他サーバーの招待リンクを自動でブロック", d.get("invite_block"), "both", "security", "admin", False),
                     ("spam", "🧹", "スパム対策", "連続投稿を自動削除して5分タイムアウト", am["spam"], "both", "automod", "admin", False),
                     ("amInvite", "✂️", "招待リンク削除", "招待リンクを含むメッセージを自動削除", am["invite"], "both", "automod", "admin", False),
+                    ("lockdown", "🔒", "ロックダウン", "全チャンネルの書き込みを一時停止。Raid検知で自動にも" + sm("lockdown")[1], sm("lockdown")[0], None, "security", "manage_guild", False),
+                    ("quarantine", "🚧", "新規アカウントの隔離", "作られて間もないアカウントを隔離チャンネルへ" + sm("quarantine")[1], sm("quarantine")[0], "both", "security", "manage_guild", False),
                     ("ignore", "🙈", "監視しないチャンネル", f"指定したチャンネルでは全機能を停止（{len(ctx.get_ignored_channels(gid))}件）", bool(ctx.get_ignored_channels(gid)), None, "security", "admin", False),
                     ("ocr", "🔍", "OCR画像検閲", "画像内の文字を読み取り、禁止ワードや招待リンクを検出" + xm("ocr")[1], xm("ocr")[0], "both", "security", "admin", False),
                 ]),
@@ -655,6 +663,7 @@ def register(app, ctx):
                     ("translate", "🌐", "翻訳", "国旗リアクションや指定チャンネルで自動翻訳（DeepL）" + xm("translate")[1], xm("translate")[0], "both", "tools", "manage_guild", False),
                     ("threads", "🧵", "スレッド管理", "指定チャンネルの投稿に自動でスレッドを作成", xm("threads")[0], "both", "tools", "manage_guild", False),
                     ("say", "📣", "代理送信", "テキスト・埋め込み・Webhookで、Botから送信（メンションは任意）", ext is not None, None, "media", "manage_guild", False),
+                    ("tempvc", "➕", "一時VC", "作成用VCに入ると専用VCを作成、空になると自動で削除" + sm("tempvc")[1], sm("tempvc")[0], "both", "media", "manage_guild", False),
                     ("vclink", "🎧", "VC連動公開", "VCに参加中の人だけに聞き専チャンネルを表示" + xm("vclink")[1], xm("vclink")[0], "both", "media", "admin", False),
                     ("html", "📄", "チャンネルHTML保存", "チャンネルの会話をHTMLファイルとしてダウンロード", ext is not None, None, "media", "admin", False),
                     ("recording", "🎙️", "録音", "VCを話した人ごとに録音し、ZIPで送信" + rec_state[1], rec_state[0], "both", "media", "admin", False),
@@ -785,11 +794,17 @@ def register(app, ctx):
                         "このバックアップから復元", cls="btn danger", need="admin") if backups else ""), need="admin"))
             if ext is not None:
                 html_parts.append(ext.ocr_card(gid, H))
+            stc = b_cog("ServerTools")
+            if stc is not None:
+                html_parts.append(stc.render_security(gid, guild, H))
         elif tab in EXT_TABS:
             if ext is None:
                 html_parts.append(card("🧩 追加モジュール", '<p class="mut">extras.py が読み込まれていません。ファイルを配置して再起動してください。</p>'))
             else:
                 html_parts.append(await ext.render(tab, gid, guild, member, H))
+            stc = b_cog("ServerTools")
+            if tab == "media" and stc is not None:
+                html_parts.append(stc.render_media(gid, guild, H))
         elif tab == "sticky":
             cog = ctx.bot.get_cog("Sticky")
             if cog is None:
@@ -972,7 +987,9 @@ def register(app, ctx):
 
     # ================= 保存 =================
     OP_NEED = {"auth_save": "admin", "panel_send": "admin", "logs_save": "manage_guild", "nuke_save": "admin",
-               "wl_edit": "admin", "ignore_save": "admin", "rec_save": "admin", "rec_stop": "admin", "purge_run": "manage_messages", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
+               "wl_edit": "admin", "ignore_save": "admin", "rec_save": "admin", "rec_stop": "admin", "purge_run": "manage_messages",
+               "st_lock": "manage_guild", "st_unlock": "manage_guild", "st_lock_save": "manage_guild",
+               "st_q_save": "manage_guild", "st_q_setup": "admin", "st_release": "moderate", "st_vc_save": "manage_guild", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
                "sticky_set": "manage_messages", "sticky_remove": "manage_messages", "weather_save": "manage_guild",
                "disaster_save": "manage_guild", "quake_save": "manage_guild", "eew_save": "manage_guild",
                "level_save": "manage_guild", "level_role": "manage_guild", "level_noxp": "manage_guild",
@@ -1009,7 +1026,14 @@ def register(app, ctx):
             return forbidden(request, sess, f"{op} を権限なしで実行しようとした")
         gid = guild.id
         try:
-            if op == "purge_run":
+            if op.startswith("st_"):
+                stc = b_cog("ServerTools")
+                if stc is None:
+                    raise ValueError("server_tools.py が読み込まれていません")
+                P = SimpleNamespace(pick_channel=lambda raw, required=False, voice=False: pick_channel(
+                    guild, raw, required=required, voice=voice))
+                done = await stc.dashboard_op(op, f, guild, member, P)
+            elif op == "purge_run":
                 pg = b_cog("Purge")
                 if pg is None:
                     raise ValueError("メッセージ削除（purge.py）が読み込まれていません")
@@ -1367,6 +1391,11 @@ def register(app, ctx):
         # ---------- モジュール一覧のトグル ----------
         if op == "module_toggle":
             key, on = f.get("key", ""), f.get("to") == "1"
+            if key in ("quarantine", "tempvc"):
+                stc = b_cog("ServerTools")
+                if stc is None:
+                    raise ValueError("server_tools.py が読み込まれていません")
+                return f"{'新規アカウントの隔離' if key == 'quarantine' else '一時VC'} を{stc.toggle(gid, key, on)}にしました"
             if key == "recording":
                 rec = b_cog("Recorder")
                 if rec is None:

@@ -6,7 +6,7 @@ from discord import app_commands
 from discord.ext import commands
 
 CATEGORIES = [
-    ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "purge"]),
+    ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "purge", "lockdown"]),
     ("🎉 イベント・アンケート", ["event", "poll"]),
     ("🧰 便利機能", ["faq", "record", "translate", "invite-stats", "help"]),
     ("📈 レベル・ランク", ["rank", "leaderboard"]),
