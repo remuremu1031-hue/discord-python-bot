@@ -4,7 +4,7 @@
   参加・交流: イベント（参加ボタン・開始前リマインド・Discordのイベント登録）／アンケート・日程調整（ボタン投票）
   運営・管理: 翻訳（DeepL。環境変数 DEEPL_API_KEY）／自動メッセージ／週次レポート／FAQ／スレッド管理
   配信・通知: YouTube Push（WebSub＋RSSの予備確認）／代理送信（テキスト・埋め込み・Webhook、任意メンション）
-  VC・保存  : VC連動公開（VC参加中だけ聞き専チャンネルを表示）／チャンネルHTML保存／録音（準備中）
+  VC・保存  : VC連動公開（VC参加中だけ聞き専チャンネルを表示）／チャンネルHTML保存／録音（recorder.py）
 
 設定は bot.store_load("extras_config")[サーバーID]、投票・イベントは "extras_polls" / "extras_events"。
 ダッシュボード（guild_dashboard.py）からは render() と dashboard_op() を呼ぶ。
@@ -1084,8 +1084,11 @@ class Extras(commands.Cog):
                 H.lbl("書き出すチャンネル") + H.sel("channel", H.channel_options(None))
                 + H.lbl("最新から何件（最大5000）") + '<input type="text" name="limit" maxlength="4" value="1000">',
                 "HTMLをダウンロード", need="admin"), need="admin", note="会話をきれいなHTMLファイルにして、この画面からダウンロードします。"))
-            out.append(H.card("🎙️ 録音", '<span class="badge">準備中</span><p class="mut">Discordの音声の暗号化方式（DAVE）と、'
-                              'discord.py が音声の受信に対応していないため、現在は提供できません。</p>'))
+            rec = self.bot.get_cog("Recorder")
+            if rec is not None:
+                out.append(rec.render_card(gid, guild, H))
+            else:
+                out.append(H.card("🎙️ 録音", '<p class="mut">recorder.py が読み込まれていません。</p>'))
         return "".join(out)
 
     def ocr_card(self, gid: int, H) -> str:

@@ -1,8 +1,20 @@
+# 霊夢BOT
+# discord.py 本体（録音に対応できる 2.7.1 に固定。[voice] で音声用の部品も入る）
+discord.py[voice]==2.7.1
+# 音声の暗号化（DAVE）。0.2 以降は discord.py 2.7.1 と合わず、録音が解読できなくなるため 0.2 未満に固定
+davey>=0.1.6,<0.2
+# 音声の受信（録音）。DAVE の解読に対応した版
+discord-ext-voice-recv @ git+https://github.com/Florian-85/discord-ext-voice-recv@5f3b5f09b870d671cb9f5d6e9122f772cde7eb64
+
+# Web（認証・ダッシュボード・公式サイト）
 fastapi
 uvicorn
-discord.py
-upstash-redis
-python-dotenv
-httpx
 slowapi
+httpx
+aiohttp
+python-dotenv
+dotenv
+
+# 設定の保存（Upstash Redis）
 redis
+

@@ -552,6 +552,9 @@ def register(app, ctx):
         ext = b_cog("Extras")
         xs = ext.module_states(gid) if ext is not None else {}
 
+        rec_cog = b_cog("Recorder")
+        rec_state = rec_cog.module_state(gid) if rec_cog is not None else (False, "（未導入）")
+
         def xm(key):
             return xs.get(key, (False, "（未導入）"))
 
@@ -622,7 +625,7 @@ def register(app, ctx):
                     ("say", "📣", "代理送信", "テキスト・埋め込み・Webhookで、Botから送信（メンションは任意）", ext is not None, None, "tools", "manage_guild", False),
                     ("vclink", "🎧", "VC連動公開", "VCに参加中の人だけに聞き専チャンネルを表示" + xm("vclink")[1], xm("vclink")[0], "both", "media", "admin", False),
                     ("html", "📄", "チャンネルHTML保存", "チャンネルの会話をHTMLファイルとしてダウンロード", ext is not None, None, "media", "admin", False),
-                    ("recording", "🎙️", "録音", "VCの録音（Discord側の仕様により準備中）", False, None, "media", "admin", False),
+                    ("recording", "🎙️", "録音", "VCを話した人ごとに録音し、ZIPで送信" + rec_state[1], rec_state[0], "both", "media", "admin", False),
                 ]),
             ]
             out = []
@@ -643,7 +646,7 @@ def register(app, ctx):
                         f'<div class="card mod{" wide" if wide else ""}"><div class="top"><div class="g" style="gap:12px">'
                         f'<div class="ic">{ic}</div><div class="name">{_e(name)}</div></div>{sw}</div>'
                         f'<div class="desc">{_e(desc)}</div><div class="foot">'
-                        f'<span class="badge{" on" if on else ""}">{"準備中" if key == "recording" else ("有効" if on else "無効")}</span>'
+                        f'<span class="badge{" on" if on else ""}">{"有効" if on else "無効"}</span>'
                         f'<a class="open" href="{href}">設定を開く ›</a></div></div>')
                 out.append(f'<div class="sec"><h3>{_e(gname)}</h3><div class="line"></div></div><div class="bento">{"".join(cards)}</div>')
             html_parts.append("".join(out))
@@ -923,7 +926,7 @@ def register(app, ctx):
 
     # ================= 保存 =================
     OP_NEED = {"auth_save": "admin", "panel_send": "admin", "logs_save": "manage_guild", "nuke_save": "admin",
-               "wl_edit": "admin", "ignore_save": "admin", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
+               "wl_edit": "admin", "ignore_save": "admin", "rec_save": "admin", "rec_stop": "admin", "nuke_exempt": "admin", "raid_exempt": "admin", "sbl_edit": "admin", "backup_create": "admin", "backup_restore": "admin",
                "sticky_set": "manage_messages", "sticky_remove": "manage_messages", "weather_save": "manage_guild",
                "disaster_save": "manage_guild", "quake_save": "manage_guild", "eew_save": "manage_guild",
                "level_save": "manage_guild", "level_role": "manage_guild", "level_noxp": "manage_guild",
@@ -959,7 +962,13 @@ def register(app, ctx):
             return forbidden(request, sess, f"{op} を権限なしで実行しようとした")
         gid = guild.id
         try:
-            if op.startswith("x_"):
+            if op in ("rec_save", "rec_stop"):
+                rec = b_cog("Recorder")
+                if rec is None:
+                    raise ValueError("録音機能（recorder.py）が読み込まれていません")
+                P = SimpleNamespace(pick_channel=lambda raw, required=False: pick_channel(guild, raw, required=required))
+                done = await rec.dashboard_op(op, f, guild, P)
+            elif op.startswith("x_"):
                 ext = b_cog("Extras")
                 if ext is None:
                     raise ValueError("追加モジュール（extras.py）が読み込まれていません")
@@ -1281,6 +1290,11 @@ def register(app, ctx):
         # ---------- モジュール一覧のトグル ----------
         if op == "module_toggle":
             key, on = f.get("key", ""), f.get("to") == "1"
+            if key == "recording":
+                rec = b_cog("Recorder")
+                if rec is None:
+                    raise ValueError("録音機能（recorder.py）が読み込まれていません")
+                return f"録音 を{rec.toggle(gid, on)}にしました"
             if key in EXT_TOGGLE:
                 if not perms[EXT_TOGGLE[key]]:
                     raise ValueError("このモジュールを切り替える権限がありません")

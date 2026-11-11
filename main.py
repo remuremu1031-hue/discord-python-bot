@@ -799,12 +799,12 @@ KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel",
                  "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
                  "nuke-whitelist", "defense-exempt", "ignore-channel", "subaccount", "transcript-channel", "help",
                  "weather", "disaster", "sticky", "invite-stats", "invite-log", "invite-recount", "main-log", "rank", "leaderboard", "level",
-                 "translate", "poll", "event", "faq", "say", "export-channel"}  # 残すスラッシュコマンド
+                 "translate", "poll", "event", "faq", "say", "export-channel", "record"}  # 残すスラッシュコマンド
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
               "event_logs", "moderation", "automod",
-              "jma_alerts", "help", "sticky", "invite_tracker", "levels", "extras"]  # cogs/ フォルダの追加機能
+              "jma_alerts", "help", "sticky", "invite_tracker", "levels", "extras", "recorder"]  # cogs/ フォルダの追加機能
 
 # ファイル名の別名（例: reaction_role.py でも reaction_roles として読み込む）
 COG_ALIASES = {"reaction_roles": ["reaction_role"], "event_logs": ["event_log"],
@@ -4312,6 +4312,10 @@ PRIVACY_SECTIONS = [
               "取得した個人情報を第三者に提供することはありません。"),
         ("p", "なお、本ボットの運用のため、通信経路（Cloudflare等）やデータの保存先（Upstash等）の"
               "外部サービスを利用しており、これらのサービス上で情報が処理・保存されます。"),
+        ("p", "録音機能（/record）を使った場合、ボイスチャンネルの音声を話した人ごとに一時的に保存し、"
+              "録音ファイルとしてサーバーの指定チャンネルに送信します。送信後、Bot側のファイルは削除します"
+              "（ファイルが大きい場合はダウンロードリンクにし、24時間後に削除します）。"
+              "録音中はボイスチャンネルで必ず通知し、録音されたくない人は自分の声を除外できます。"),
         ("p", "翻訳機能を使った場合はその文章を DeepL（DeepL SE）に、OCR画像検閲が有効なサーバーでは"
               "投稿された画像を Google Cloud Vision（Google LLC）に送信して処理します。"
               "これらは各サービスの規約に従って処理され、当方が画像そのものを保存することはありません。"),
@@ -4843,6 +4847,7 @@ if __name__ == "__main__":
                          ("invite_log_config", Path("invite_log_config.json")),
                          ("level_config", Path("level_config.json")),
                          ("extras_config", Path("extras_config.json")),
+                         ("record_config", Path("record_config.json")),
                          ("home_updates", Path("home_updates.json")),
                          ("dash_sessions", Path("dash_sessions.json")),
                          ("ignore_channels", Path("ignore_channels.json")),
