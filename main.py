@@ -1179,6 +1179,12 @@ class AuthBot(commands.Bot):
             self.refresh_status.start()
         if not self.auto_backup.is_running():
             self.auto_backup.start()
+        if not getattr(self, "_csrf_fix_done", False):
+            self._csrf_fix_done = True
+            try:
+                clear_false_csrf_blocks()
+            except Exception as e:
+                print(f"ブロックの解除に失敗: {safe_error(e)}")
         if not getattr(self, "_integrity_started", False):  # プログラムの改ざん検知
             self._integrity_started = True
             _code_state["boot"] = code_fingerprints()
@@ -1671,7 +1677,8 @@ async def code_integrity_approve(uid: int, digest: str) -> str:
     return f"✅ 承認しました（{digest}）。" + ("Botの機能を再開しました。" if CODE_LOCK else "")
 
 
-async def dm_owners(embed: discord.Embed, *, dedupe: str | None = None, cooldown: float = 30) -> None:
+async def dm_owners(embed: discord.Embed, *, dedupe: str | None = None, cooldown: float = 30,
+                    view: discord.ui.View | None = None) -> None:
     """Botのオーナーへ、DMで緊急警告を送る。"""
     now = time.time()
     if dedupe:
@@ -1685,7 +1692,7 @@ async def dm_owners(embed: discord.Embed, *, dedupe: str | None = None, cooldown
     for oid in owner_ids:
         try:
             user = bot.get_user(oid) or await bot.fetch_user(oid)
-            await user.send(embed=embed)
+            await user.send(embed=embed, **({"view": view} if view else {}))
         except Exception as e:
             print(f"オーナーへのDM送信に失敗: {safe_error(e)}")
 
@@ -4051,8 +4058,49 @@ async def _guard_block(kind: str, ident: str, reasons: list[str], detail: str, r
     if detail:
         embed.add_field(name="詳細", value=detail[:1000], inline=False)
     embed.add_field(name="ブロック期間", value=f"{span}（{count}回目）", inline=True)
-    embed.set_footer(text="解除はダッシュボードの「自動ブロック」タブから")
-    await dm_owners(embed, dedupe=f"block:{kind}:{ident}", cooldown=60)
+    embed.set_footer(text="解除は下のボタン、またはダッシュボードの「自動ブロック」タブから")
+    view = None
+    if len(ident) <= 70:  # 誤検知のとき、所有者がDMからすぐ解除できるように
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label="このブロックを解除する", emoji="🔓", style=discord.ButtonStyle.secondary,
+                                        custom_id=f"xguard:unblock:{kind}:{ident}"))
+    await dm_owners(embed, dedupe=f"block:{kind}:{ident}", cooldown=60, view=view)
+
+
+@bot.listen("on_interaction")
+async def _guard_unblock_button(interaction: discord.Interaction):
+    if interaction.type != discord.InteractionType.component:
+        return
+    cid = (interaction.data or {}).get("custom_id", "")
+    if not cid.startswith("xguard:unblock:"):
+        return
+    if interaction.user.id not in await bot.get_owner_ids():
+        await interaction.response.send_message("Botの所有者だけが解除できます。", ephemeral=True)
+        return
+    _, _, kind, ident = cid.split(":", 3)
+    if kind not in ("ip", "user"):
+        return
+    ok = guard_unblock(kind, ident)
+    _guard_points.pop(f"{kind}:{ident}", None)
+    await interaction.response.send_message("🔓 ブロックを解除しました。" if ok else "すでに解除されています。", ephemeral=True)
+
+
+def clear_false_csrf_blocks() -> int:
+    """送信元確認の誤判定（Origin: null）でかかったブロックを、まとめて解除する。"""
+    d = load_blocks()
+    n = 0
+    for kind in ("ip", "user"):
+        for ident, rec in d[kind].items():
+            if GUARD_LABEL["csrf"] in str(rec.get("reason", "")) and rec.get("until", 0) > time.time():
+                rec["until"] = 0
+                rec["count"] = max(0, int(rec.get("count", 1)) - 1)
+                n += 1
+    if n:
+        storage.save("security_blocks", SEC_BLOCK_FILE, d)
+        print(f"🔓 誤判定によるブロックを {n} 件解除しました")
+    for k in [k for k, dq in _guard_points.items() if any(r == "csrf" for _, _, r in dq)]:
+        _guard_points.pop(k, None)
+    return n
 
 
 def guard_check_interaction(interaction: discord.Interaction) -> str | None:
