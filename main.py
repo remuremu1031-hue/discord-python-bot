@@ -5114,7 +5114,7 @@ dashboard_callback = None if dashboard is None else dashboard.register(app, Simp
     bot=bot, client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
     base_url=lambda: BASE_URL or f"http://localhost:{PORT}",  # クイックトンネルで後から変わるので関数で渡す
     oauth_redirect_uri=lambda: REDIRECT_URI,  # 認証と同じ /callback を使う（追加のRedirect登録は不要）
-    get_owner_ids=bot.get_owner_ids, limiter=limiter, client_ip=client_ip,
+    get_owner_ids=bot.get_owner_ids, limiter=limiter, client_ip=client_ip, guard_strike=guard_strike,
     notify_owner_login=lambda name, request: notify_owner_login(name, request),
     load_sessions=lambda: storage.load("dash_sessions", Path("dash_sessions.json")),
     save_sessions=lambda data: storage.save("dash_sessions", Path("dash_sessions.json"), data),

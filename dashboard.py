@@ -570,7 +570,14 @@ def register(app, ctx):
         user = r.json()
         uid = int(user["id"])
         if uid not in await ctx.get_owner_ids():
-            ctx.guard_web_strike(request, "dashboard_denied")
+            ctx.guard_web_strike(request, "dashboard_denied")  # 接続元（IP）をブロック
+            strike = getattr(ctx, "guard_strike", None)
+            if strike:  # Discordアカウントもブロック（Botのコマンド・ボタン・認証も使えなくなる）
+                try:
+                    strike("user", uid, "dashboard_denied", request=request,
+                           detail=f"所有者ダッシュボードへのログイン試行（{user.get('username', '')}）")
+                except Exception:
+                    pass
             asyncio.create_task(ctx.send_security_alert(
                 "ダッシュボードへの不正ログイン試行",
                 f"Botのオーナー以外のアカウント（ID: {uid}）がダッシュボードにログインしようとしました",
