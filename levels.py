@@ -391,6 +391,14 @@ class Levels(commands.Cog):
         await interaction.response.send_message(
             f"✅ XP対象外: {' '.join(f'<#{x}>' for x in s) or 'なし'}", ephemeral=True)
 
+    async def set_member_level(self, member: discord.Member, level: int) -> None:
+        """ユーザーのレベルを変更する（ダッシュボードからも使う）。0でリセット。"""
+        if level == 0:
+            await self.store.remove(member.guild.id, member.id)
+        else:
+            await self.store.set_xp(member.guild.id, member.id, total_xp_for(level))
+        await self.apply_rank_roles(member, level, self.cfg(member.guild.id))
+
     @level.command(name="set", description="ユーザーのレベルを変更します（XPはそのレベルの最初の値になります）")
     @app_commands.describe(user="対象ユーザー", level="設定するレベル（0でリセット）")
     async def set_level(self, interaction: discord.Interaction, user: discord.Member,

@@ -51,8 +51,8 @@ MODULES = [
      ["ダッシュボード「📺 配信・VC」で、チャンネルのURLまたはIDと通知先を登録します。",
       "通知のたびにメンションするロールも選べます。"], "media", ""),
     ("say", "📣", "代理送信", "Botから、テキスト・埋め込み・Webhookでお知らせを送信。メンションの有無も選べます。",
-     ["/say で送信先と本文を指定します。",
-      "ダッシュボード「🧰 便利ツール」→「代理送信」では、埋め込みの色やWebhookの名前も指定できます。"], "tools", ""),
+     ["ダッシュボード「🧰 便利ツール」→「代理送信」で、送信先・本文・送信方法を選んで送ります。",
+      "埋め込みの色やWebhookの名前、メンションの有無も指定できます。"], "tools", ""),
     ("report", "📈", "定期レポート", "メンバーの増減・参加と退出・メッセージ数・よく使われたチャンネルを、毎週まとめてお届けします。",
      ["ダッシュボード「🧰 便利ツール」→「週次レポート」で、送信先・曜日・時刻を選びます。"], "tools", ""),
     ("faq", "❓", "FAQ", "よくある質問をパネルにまとめて、ボタンで回答。キーワードへの自動回答もできます。",
@@ -68,8 +68,8 @@ MODULES = [
       "VCに入って /record start で開始、/record stop で終了します。",
       "終了すると、話した人ごとのファイル（Ogg）をまとめたZIPが送られます。"], "media", ""),
     ("html", "📄", "チャンネルHTML保存", "チャンネルの会話を、見やすいHTMLファイルとして保存。記録の保管や引き継ぎに。",
-     ["/export-channel で、最新から指定した件数を書き出します。",
-      "ダッシュボード「📺 配信・VC」からは、その場でダウンロードできます。"], "media", ""),
+     ["ダッシュボード「📺 配信・VC」→「チャンネルHTML保存」で、チャンネルと件数を選びます。",
+      "その場でHTMLファイルがダウンロードされます。"], "media", ""),
 ]
 
 # 3つの柱（ヒーロー下）
@@ -481,7 +481,7 @@ def register(app, ctx) -> SimpleNamespace:
             for i, (k, ic, n, d, us, _t, st) in enumerate(MODULES, 1))
         body = f"""<div class="page"><div class="wrap">
 <div class="eyebrow">GUIDE</div><h2>導入ガイド</h2>
-<p class="sub">サーバーへの追加から、各モジュールの使い方までをまとめています。コマンドの一覧は、Discordで <code>/help</code> を送ると確認できます。</p>
+<p class="sub">サーバーへの追加から、各モジュールの使い方までをまとめています。設定はすべてダッシュボードから行います。その場で使うコマンドの一覧は、Discordで <code>/help</code> を送ると確認できます。</p>
 <div class="ctabox" style="margin-bottom:40px"><a class="btn pri" href="{inv}" target="_blank" rel="noopener">Discordに追加する ↗</a><a class="btn sec" href="/demo">操作デモを見る</a></div>
 <h3 style="font-size:22px">はじめの設定</h3>{steps}
 <h3 style="font-size:22px;margin-top:44px">モジュールの使い方</h3><div class="toc">{toc}</div>{items}

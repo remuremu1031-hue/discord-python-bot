@@ -6,13 +6,10 @@ from discord import app_commands
 from discord.ext import commands
 
 CATEGORIES = [
-    ("🔐 認証", ["setup", "authlink", "panel", "subaccount", "server-blacklist"]),
-    ("🛡️ セキュリティ", ["nuke-defense", "nuke-whitelist", "defense-exempt", "ignore-channel", "backup", "set-log-channel", "automod", "eventlog"]),
-    ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban", "mass_role"]),
-    ("🎫 便利機能", ["ticket", "transcript-channel", "reactionrole", "sticky", "main-log", "invite-log", "invite-stats", "invite-recount", "weather",
-                    "disaster", "broadcast-channel", "help"]),
-    ("📈 レベル・ランク", ["rank", "leaderboard", "level"]),
-    ("🧰 追加モジュール", ["event", "poll", "faq", "translate", "say", "export-channel", "record"]),
+    ("🔨 モデレーション", ["warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban"]),
+    ("🎉 イベント・アンケート", ["event", "poll"]),
+    ("🧰 便利機能", ["faq", "record", "translate", "invite-stats", "help"]),
+    ("📈 レベル・ランク", ["rank", "leaderboard"]),
     ("👑 オーナー専用", ["broadcast", "blacklist", "license", "gban"]),
 ]
 OWNER_CAT = "👑 オーナー専用"
@@ -105,14 +102,18 @@ class HelpCog(commands.Cog):
     def _top_embed(self, is_owner: bool) -> discord.Embed:
         cmds = self._commands()
         known = {n for _, ns in CATEGORIES for n in ns}
+        try:
+            base = (self.bot.public_base_url() or "").rstrip("/")
+        except Exception:
+            base = ""
+        dash = f"{base}/guild-dashboard" if base else "公式サイトの「ダッシュボード」"
         e = discord.Embed(title="📖 コマンド一覧と使い方", color=0x5865F2,
                           description="下のメニューでカテゴリを選ぶと、使い方を詳しく表示します。\n\n"
-                                      "**はじめに**\n"
-                                      "・認証の設置: `/setup` → `/panel`\n"
-                                      "・荒らし対策: `/nuke-defense` → `/set-log-channel`\n"
-                                      "・案内を一番下に固定: `/sticky set`\n"
-                                      "・レベル・ランク: `/rank` ／ 設定は `/level`\n"
-                                      "・Webでまとめて設定: 認証ページのURLの `/guild-dashboard`")
+                                      "**⚙️ 設定はすべてダッシュボードから**\n"
+                                      "認証・荒らし対策・ログ・自動モデレーション・チケット・ロール・天気/災害・レベル・"
+                                      "固定メッセージなどの設定は、Webのダッシュボードで行います（サーバー管理権限が必要）。\n"
+                                      f"{dash}\n\n"
+                                      "ここには、その場で使うコマンドだけを載せています。")
         for cat, names in CATEGORIES:
             if cat == OWNER_CAT and not is_owner:
                 continue

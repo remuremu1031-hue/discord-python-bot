@@ -349,11 +349,21 @@ class InviteTracker(commands.Cog):
             await interaction.response.send_message("「サーバーの管理」権限が必要です。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        guild = interaction.guild
+        try:
+            counts = await self.recount(interaction.guild)
+        except ValueError as e:
+            await interaction.followup.send(str(e))
+            return
+        top = "\n".join(f"・<@{u}>: {n}回" for u, n in sorted(counts.items(), key=lambda x: -x[1])[:15])
+        await interaction.followup.send(
+            f"✅ 数え直しました（今ある招待リンク {sum(counts.values())} 件）。\n{top or '招待リンクはありません。'}",
+            allowed_mentions=discord.AllowedMentions.none())
+
+    async def recount(self, guild: discord.Guild) -> dict[int, int]:
+        """招待リンクの累計作成数を、今ある招待リンクから数え直す（ダッシュボードからも使う）。"""
         snap = await self._refresh(guild)
         if snap is None:
-            await interaction.followup.send("Botに「サーバーの管理」権限がないため、招待リンクを取得できません。")
-            return
+            raise ValueError("Botに「サーバーの管理」権限がないため、招待リンクを取得できません。")
         removed = 0
         if getattr(self.bot, "kv_ready", lambda: False)():
             try:
@@ -367,8 +377,7 @@ class InviteTracker(commands.Cog):
                         if not cursor:
                             break
             except Exception as e:
-                await interaction.followup.send(f"Redisの操作に失敗しました（{type(e).__name__}）。")
-                return
+                raise ValueError(f"Redisの操作に失敗しました（{type(e).__name__}）。")
         for k in [k for k in kv._mem if k.startswith((f"invcount:{guild.id}:", f"invmeta:{guild.id}:"))]:
             kv._mem.pop(k, None)
         self._cache[guild.id] = snap
@@ -377,10 +386,7 @@ class InviteTracker(commands.Cog):
         for c, d in snap.items():
             if c != "__vanity__" and d.get("inviter"):
                 counts[d["inviter"]] = counts.get(d["inviter"], 0) + 1
-        top = "\n".join(f"・<@{u}>: {n}回" for u, n in sorted(counts.items(), key=lambda x: -x[1])[:15])
-        await interaction.followup.send(
-            f"✅ 数え直しました（今ある招待リンク {sum(counts.values())} 件）。\n{top or '招待リンクはありません。'}",
-            allowed_mentions=discord.AllowedMentions.none())
+        return counts
 
 
 async def setup(bot: commands.Bot):

@@ -469,7 +469,7 @@ _IGNORE_EVENTS = {"message", "message_edit", "message_delete", "bulk_message_del
                   "reaction_add", "reaction_remove", "reaction_clear", "reaction_clear_emoji",
                   "raw_reaction_add", "raw_reaction_remove", "raw_reaction_clear", "raw_reaction_clear_emoji",
                   "typing", "raw_typing", "interaction"}
-IGNORED_CHANNEL_TEXT = "🙈 このチャンネルでは、霊夢BOTは停止しています。（管理者は `/ignore-channel` で戻せます）"
+IGNORED_CHANNEL_TEXT = "🙈 このチャンネルでは、霊夢BOTは停止しています。（管理者はダッシュボードの「セキュリティ」から戻せます）"
 
 
 def interaction_in_ignored_channel(interaction: discord.Interaction) -> bool:
@@ -794,12 +794,18 @@ class TicketControlView(discord.ui.View):
             print(f"チャンネル削除エラー: {safe_error(e)}")
 
 
-KEEP_COMMANDS = {"setup", "authlink", "panel", "broadcast", "broadcast-channel", "blacklist", "server-blacklist", "license", "gban", "set-log-channel",
-                 "mass_role", "ticket", "warn", "warnings", "reactionrole", "timeout", "kick",
-                 "ban", "automod", "eventlog", "clearwarnings", "untimeout", "unban", "nuke-defense", "backup",
-                 "nuke-whitelist", "defense-exempt", "ignore-channel", "subaccount", "transcript-channel", "help",
-                 "weather", "disaster", "sticky", "invite-stats", "invite-log", "invite-recount", "main-log", "rank", "leaderboard", "level",
-                 "translate", "poll", "event", "faq", "say", "export-channel", "record"}  # 残すスラッシュコマンド
+# 残すスラッシュコマンド（その場で使うものだけ）。設定はすべてサーバー管理ダッシュボードから行う
+KEEP_COMMANDS = {
+    "help",
+    # モデレーション
+    "warn", "warnings", "clearwarnings", "timeout", "untimeout", "kick", "ban", "unban",
+    # イベント・アンケート・FAQ・録音・翻訳
+    "event", "poll", "faq", "record", "translate",
+    # レベル・招待（見るだけ）
+    "rank", "leaderboard", "invite-stats",
+    # Botの所有者専用
+    "broadcast", "blacklist", "license", "gban",
+}
 
 
 EXTRA_COGS = ["mass_role", "tickets", "warns", "reaction_roles",
@@ -1129,6 +1135,9 @@ class AuthBot(commands.Bot):
             if name in DISABLED_COGS:
                 continue
             await self.load_extra_cog(name)
+        for cmd in list(self.tree.get_commands()):  # 設定用のコマンドは登録しない（ダッシュボードで設定）
+            if cmd.name not in KEEP_COMMANDS:
+                self.tree.remove_command(cmd.name, type=cmd.type if hasattr(cmd, "type") else discord.AppCommandType.chat_input)
         if SYNC_COMMANDS:
             try:
                 await self.tree.sync()  # グローバルコマンドを現在のコードの内容に同期

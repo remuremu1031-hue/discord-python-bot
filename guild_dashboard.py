@@ -676,15 +676,18 @@ def register(app, ctx):
                 "保存する"), note="下で個別のチャンネルを決めていないログは、すべてここに届きます。"
                 "個別に決めたログは、そのチャンネルだけに届きます（メインログには重ねて送りません）。"))
             html_parts.append(card("📝 個別のログチャンネル", form("logs_save",
-                lbl("セキュリティ・GBAN・設定変更のログ（/set-log-channel）") + sel("log_channel", channel_options(guild, log_id, none_label=to_main))
-                + lbl("チケットのトランスクリプト（/transcript-channel）") + sel("transcript", channel_options(guild, ctx.get_transcript_channel_id(gid), none_label=to_main))
-                + lbl("招待リンクの作成・参加の記録（/invite-log）") + sel("invite_log", channel_options(guild, int(inv) if inv else None, none_label=to_main))
+                lbl("セキュリティ・GBAN・設定変更のログ") + sel("log_channel", channel_options(guild, log_id, none_label=to_main))
+                + lbl("チケットのトランスクリプト") + sel("transcript", channel_options(guild, ctx.get_transcript_channel_id(gid), none_label=to_main))
+                + lbl("招待リンクの作成・参加の記録") + sel("invite_log", channel_options(guild, int(inv) if inv else None, none_label=to_main))
                 + lbl("霊夢BOTからのお知らせ（/broadcast-channel・管理者のみ）") + sel("broadcast", channel_options(guild, bc, none_label="（自動で選ぶ）")),
                 "保存する"), note="認証ログは「認証」タブ、イベントログは「自動モデ・ログ」タブで決められます。"))
+            if b_cog("InviteTracker") is not None:
+                html_parts.append(card("🔁 招待数の数え直し", form("invite_recount", "", "今ある招待リンクから数え直す", cls="btn danger"),
+                    note="招待リンクの累計作成数を、今ある招待リンクから数え直します（過去の累計はリセットされます）。"))
         elif tab == "security":
             d = ctx.load_defense_config().get(str(gid), {})
             act = d.get("action", "ban")
-            html_parts.append(card("🛡️ Nuke・Raid対策（/nuke-defense）", form("nuke_save",
+            html_parts.append(card("🛡️ Nuke・Raid対策", form("nuke_save",
                 chk("nuke_defense", d.get("nuke_defense"), "Nuke（大量削除・大量BAN等）を自動検知する")
                 + lbl("Nukeの実行者への自動対処") + sel("action", opt("ban", "BAN", act) + opt("kick", "キック", act) + opt("strip", "権限剥奪（ロールを全て外す）", act))
                 + chk("auto_restore", d.get("auto_restore", True), "消されたチャンネル・ロールを自動で復元する")
@@ -693,21 +696,21 @@ def register(app, ctx):
                 "保存する", need="admin"), need="admin"))
             wl = [int(x) for x in d.get("whitelist", [])]
             wl_html = "".join(f'<div class="mut">・<code>{u}</code> {_e(getattr(guild.get_member(u), "display_name", ""))}</div>' for u in wl) or '<div class="mut">登録なし</div>'
-            html_parts.append(card("🤝 信頼済みユーザー（/nuke-whitelist）", wl_html + form("wl_edit",
+            html_parts.append(card("🤝 信頼済みユーザー", wl_html + form("wl_edit",
                 lbl("ユーザーID") + '<input type="text" name="uid" inputmode="numeric" maxlength="21" placeholder="例: 123456789012345678">'
                 + lbl("操作") + sel("mode", opt("add", "追加", "add") + opt("remove", "削除", "")), "実行", need="admin"), need="admin",
                 note="Nuke検知の対象外にするユーザー・BOTです。"))
-            # ---- 監視しないチャンネル（/ignore-channel） ----
+            # ---- 監視しないチャンネル ----
             ign = set(ctx.get_ignored_channels(gid))
             ign_box = "".join(chk(f"c_{c.id}", c.id in ign, ("📁 " if str(getattr(c, "type", "")) == "category" else "#") + c.name)
                               for c in sorted(guild.channels, key=lambda c: (c.position, c.id)))
             ign_box += "".join(chk(f"c_{t}", True, f"🧵 スレッド {t}") for t in sorted(ign) if guild.get_channel(t) is None)
-            html_parts.append(card("🙈 監視しないチャンネル（/ignore-channel）", form("ignore_save",
+            html_parts.append(card("🙈 監視しないチャンネル", form("ignore_save",
                 '<div style="max-height:260px;overflow:auto;border:1px solid var(--line,#263243);border-radius:10px;padding:6px 10px">'
                 + ign_box + '</div>', "保存する", need="admin"), need="admin",
                 note="チェックしたチャンネル（カテゴリなら中のチャンネルすべて）では、霊夢BOTのすべての機能が止まります。"
-                     "メッセージ・リアクション・コマンド・ボタンに一切反応しません（/ignore-channel だけは、戻せるように使えます）。"))
-            # ---- 除外設定（/defense-exempt） ----
+                     "メッセージ・リアクション・コマンド・ボタンに一切反応しません。"))
+            # ---- 除外設定 ----
             ex_roles = {int(x) for x in d.get("nuke_exempt_roles", [])}
             ex_chans = {int(x) for x in d.get("nuke_exempt_channels", [])}
             ex_kinds = set(d.get("nuke_exempt_kinds", []))
@@ -717,7 +720,7 @@ def register(app, ctx):
                                for c in sorted(guild.channels, key=lambda c: (c.position, c.id)))
             kind_box = "".join(chk(f"k_{k}", k in ex_kinds, v) for k, v in KIND_LABEL.items())
             scroll = '<div style="max-height:220px;overflow:auto;border:1px solid var(--line,#263243);border-radius:10px;padding:6px 10px">{}</div>'
-            html_parts.append(card("🚫 Nukeの除外（/defense-exempt）", form("nuke_exempt",
+            html_parts.append(card("🚫 Nukeの除外", form("nuke_exempt",
                 lbl("このロールを持つ人の操作は検知しない") + scroll.format(role_box or '<span class="mut">ロールがありません</span>')
                 + lbl("このチャンネル・カテゴリの作成・削除は数えない") + scroll.format(chan_box)
                 + lbl("検知しない操作") + kind_box
@@ -726,7 +729,7 @@ def register(app, ctx):
                 note="ユーザー単位の除外は、上の「信頼済みユーザー」で設定します。自動で一時チャンネルを作るBOTなどがいる場合に使ってください。"))
             r_users = "\n".join(str(u) for u in d.get("raid_exempt_users", []))
             r_inv = "\n".join(d.get("raid_exempt_invites", []))
-            html_parts.append(card("🚫 Raidの除外（/defense-exempt）", form("raid_exempt",
+            html_parts.append(card("🚫 Raidの除外", form("raid_exempt",
                 lbl("除外するユーザーID（1行に1人）") + f'<textarea name="users" rows="3" maxlength="4000">{_e(r_users)}</textarea>'
                 + lbl("この招待リンクからの参加は数えない（コードまたはURL・1行に1つ）") + f'<textarea name="invites" rows="3" maxlength="2000" placeholder="例: abcDEF12">{_e(r_inv)}</textarea>'
                 + lbl("アカウント作成からこの日数以上の人は数えない（0で制限なし）")
@@ -735,12 +738,12 @@ def register(app, ctx):
                 note="除外された人は、Raidモード中でもキックされません。イベント用の招待リンクなど、一度に人が集まるときに使ってください。"))
             sbl = ctx.load_server_blacklist().get(str(gid), [])
             sbl_html = "".join(f'<div class="mut">・<code>{u}</code></div>' for u in sbl[:50]) or '<div class="mut">登録なし</div>'
-            html_parts.append(card("⛔ このサーバーのブラックリスト（/server-blacklist）", sbl_html + form("sbl_edit",
+            html_parts.append(card("⛔ このサーバーのブラックリスト", sbl_html + form("sbl_edit",
                 lbl("ユーザーID") + '<input type="text" name="uid" inputmode="numeric" maxlength="21">'
                 + lbl("操作") + sel("mode", opt("add", "追加（認証できなくする）", "add") + opt("remove", "削除", "")), "実行", need="admin"), need="admin"))
             backups = list(reversed(ctx.load_backups().get(str(gid), [])))
             blist = "".join(opt(i, f"{b.get('time')}{'（自動）' if b.get('auto') else ''} ロール{len(b.get('roles', []))}・チャンネル{len(b.get('channels', []))}", "") for i, b in enumerate(backups, 1))
-            html_parts.append(card("💾 バックアップ（/backup）",
+            html_parts.append(card("💾 バックアップ",
                 form("backup_create", '<p class="mut">ロール・チャンネル構成を保存します（最新10件）。</p>', "バックアップを作成", need="admin")
                 + (form("backup_restore", lbl("復元するバックアップ") + sel("number", blist)
                         + '<div class="mut">足りないロール・チャンネルだけを作り直します（既存のものは変更しません）。</div>',
@@ -763,7 +766,7 @@ def register(app, ctx):
                     f'<div class="mut">{_e((v.get("title") or "") + " " + (v.get("content") or "")[:80])}</div>'
                     + form("sticky_remove", f'<input type="hidden" name="channel" value="{_e(c)}">', "解除", cls="btn ghost", need="manage_messages")
                     + "</div>" for c, v in conf.items())
-                html_parts.append(card("📌 案内メッセージの固定（/sticky）", (rows or '<div class="mut">設定はありません</div>') + form("sticky_set",
+                html_parts.append(card("📌 案内メッセージの固定", (rows or '<div class="mut">設定はありません</div>') + form("sticky_set",
                     lbl("チャンネル") + sel("channel", channel_options(guild, None))
                     + lbl("タイトル（任意・入れると埋め込み表示）") + '<input type="text" name="title" maxlength="200">'
                     + lbl("本文") + '<textarea name="text" maxlength="1800" rows="5" style="width:100%;background:#0f172a;color:#e5e7eb;border:1px solid #334155;border-radius:10px;padding:9px;font:inherit"></textarea>'
@@ -774,13 +777,13 @@ def register(app, ctx):
         elif tab == "alerts":
             w = ctx.bot.store_load("weather_config").get(str(gid), {})
             dz = ctx.bot.store_load("disaster_config").get(str(gid), {})
-            html_parts.append(card("🗾 天気予報の自動投稿（/weather）", form("weather_save",
+            html_parts.append(card("🗾 天気予報の自動投稿", form("weather_save",
                 lbl("投稿先") + sel("channel", channel_options(guild, w.get("channel"), none_label="（停止する）"))
                 + lbl("投稿時刻（日本時間・カンマ区切り）") + f'<input type="text" name="times" maxlength="40" value="{_e(",".join(w.get("times", ["07:00"])))}">',
                 "保存する")))
             wl = dz.get("weather", "special")
             mi = dz.get("min_int", "3")
-            html_parts.append(card("🌊 津波・火山・気象警報（/disaster set）", form("disaster_save",
+            html_parts.append(card("🌊 津波・火山・気象警報", form("disaster_save",
                 lbl("通知先") + sel("channel", channel_options(guild, dz.get("channel"), none_label="（停止する）"))
                 + lbl("地震の最小震度（地震を別チャンネルに分けていないとき）") + sel("min_int", "".join(opt(v, f"震度{INT_NAME.get(v, v)}以上", mi) for v in INT_ORDER))
                 + lbl("気象警報の通知レベル") + sel("weather", opt("special", "特別警報・危険警報のみ", wl) + opt("warning", "警報以上", wl) + opt("advisory", "注意報以上（すべて）", wl) + opt("off", "通知しない", wl))
@@ -788,12 +791,12 @@ def register(app, ctx):
                 + lbl("重大な情報でメンションするロール") + sel("role", role_options(guild, member, dz.get("role"), assignable=False, none_label="（メンションしない）")),
                 "保存する")))
             qm = dz.get("quake_min_int", "3")
-            html_parts.append(card("🌏 地震情報を別チャンネルに分ける（/disaster quake）", form("quake_save",
+            html_parts.append(card("🌏 地震情報を別チャンネルに分ける", form("quake_save",
                 lbl("地震情報の通知先") + sel("channel", channel_options(guild, dz.get("quake_channel"), none_label="（分けない）"))
                 + lbl("最小震度") + sel("min_int", "".join(opt(v, f"震度{INT_NAME.get(v, v)}以上", qm) for v in INT_ORDER))
                 + lbl("震度5弱以上でメンションするロール") + sel("role", role_options(guild, member, dz.get("quake_role"), assignable=False, none_label="（メンションしない）")),
                 "保存する")))
-            html_parts.append(card("🚨 緊急地震速報（/disaster eew）", form("eew_save",
+            html_parts.append(card("🚨 緊急地震速報", form("eew_save",
                 lbl("通知先") + sel("channel", channel_options(guild, dz.get("eew_channel"), none_label="（通知しない）"))
                 + lbl("発表時にメンションするロール") + sel("role", role_options(guild, member, dz.get("eew_role"), assignable=False, none_label="（メンションしない）")),
                 "保存する"), note="予想最大震度5弱以上で発表される「警報」を通知します。"))
@@ -801,10 +804,10 @@ def register(app, ctx):
             tc = await kv_json(f"ticket:config:{gid}") or {}
             cats = '<option value="">（カテゴリーなし）</option>' + "".join(
                 f'<option value="{c.id}"{" selected" if c.id == tc.get("category_id") else ""}>{_e(c.name)}</option>' for c in guild.categories)
-            html_parts.append(card("🎫 チケット（/ticket setup）", form("ticket_setup",
+            html_parts.append(card("🎫 チケット", form("ticket_setup",
                 lbl("チケットを見られる対応ロール") + sel("role", role_options(guild, member, tc.get("role_id"), assignable=False))
                 + lbl("チケットを作るカテゴリー") + sel("category", cats), "保存する", need="admin"), need="admin"))
-            html_parts.append(card("📨 チケットのパネル（/ticket panel）", form("ticket_panel",
+            html_parts.append(card("📨 チケットのパネル", form("ticket_panel",
                 lbl("送信先") + sel("channel", channel_options(guild, None)), "パネルを送信", need="admin"), need="admin",
                 note="トランスクリプトの送信先は「ログ・通知」タブで設定できます。"))
         elif tab == "moderation":
@@ -837,11 +840,11 @@ def register(app, ctx):
             am = {"spam": False, "invite": False, **(await kv_json(f"automod:{gid}") or {})}
             ev = await kv_get(f"eventlog:{gid}")
             ev_mode = "off" if str(ev) == "0" else ("main" if not ev else "ch")
-            html_parts.append(card("🧹 自動モデレーション（/automod）", form("automod_save",
+            html_parts.append(card("🧹 自動モデレーション", form("automod_save",
                 chk("spam", am["spam"], "連続投稿スパムを自動で削除し、5分タイムアウトする")
                 + chk("invite", am["invite"], "招待リンクを自動で削除する"), "保存する", need="admin"), need="admin",
                 note="管理者・「メッセージの管理」権限のメンバーは対象外です。"))
-            html_parts.append(card("📋 イベントログ（/eventlog）", form("eventlog_save",
+            html_parts.append(card("📋 イベントログ", form("eventlog_save",
                 lbl("記録のしかた") + sel("mode", opt("main", "メインログに送る", ev_mode) + opt("ch", "下のチャンネルに送る", ev_mode)
                                        + opt("off", "記録しない", ev_mode))
                 + lbl("送信先チャンネル（「下のチャンネルに送る」のとき）")
@@ -878,7 +881,7 @@ def register(app, ctx):
                                 for k, v in emap.items()) or '<div class="mut">設定はありません</div>'
                 html_parts.append(card("😀 絵文字リアクション方式（/reactionrole add・remove）", elist
                     + '<p class="mut">追加・削除は、メッセージに絵文字を付ける操作が必要なため、スラッシュコマンドで行ってください。</p>', need="admin"))
-            html_parts.append(card("🏷️ 一斉ロール付与（/mass_role）", form("mass_role",
+            html_parts.append(card("🏷️ 一斉ロール付与", form("mass_role",
                 lbl("全員に付与するロール") + sel("role", role_options(guild, member, None))
                 + chk("confirm", False, "メンバー全員（Bot・所持済みの人を除く）に付与することを確認しました"),
                 "一斉付与を開始", cls="btn danger", need="admin"), need="admin",
@@ -887,7 +890,7 @@ def register(app, ctx):
             lc = ctx.bot.store_load("level_config").get(str(gid), {})
             ann = str(lc.get("announce", "same"))
             mode = ann if ann in ("same", "off") else "channel"
-            html_parts.append(card("📈 レベル機能（/level settings）", form("level_save",
+            html_parts.append(card("📈 レベル機能", form("level_save",
                 chk("enabled", lc.get("enabled", True), "レベル機能を有効にする")
                 + lbl("レベルアップの通知先") + sel("announce", opt("same", "発言したチャンネル", mode) + opt("channel", "指定チャンネル", mode) + opt("off", "通知しない", mode))
                 + lbl("指定チャンネル（上で「指定チャンネル」を選んだとき）") + sel("announce_channel", channel_options(guild, int(ann) if ann.isdigit() else None))
@@ -897,15 +900,19 @@ def register(app, ctx):
             roles = lc.get("roles", {})
             rr = "".join(f'<div class="mut">・レベル {lv} → @{_e(getattr(guild.get_role(int(rid)), "name", "（削除済み）"))}</div>'
                          for lv, rid in sorted(roles.items(), key=lambda kv: int(kv[0]))) or '<div class="mut">未設定</div>'
-            html_parts.append(card("🏅 ランクロール（/level role）", rr + form("level_role",
+            html_parts.append(card("🏅 ランクロール", rr + form("level_role",
                 lbl("到達レベル（1〜500）") + '<input type="text" name="level" maxlength="3" inputmode="numeric">'
                 + lbl("付与するロール（削除のときは空欄）") + sel("role", role_options(guild, member, None))
                 + lbl("操作") + sel("mode", opt("add", "追加・変更", "add") + opt("remove", "削除", "")), "実行")))
             nx = lc.get("no_xp_channels", [])
             nxh = "".join(f'<div class="mut">・{_e(getattr(guild.get_channel(c), "name", c))}</div>' for c in nx) or '<div class="mut">なし</div>'
-            html_parts.append(card("🚫 XPが貯まらないチャンネル（/level no-xp）", nxh + form("level_noxp",
+            html_parts.append(card("🚫 XPが貯まらないチャンネル", nxh + form("level_noxp",
                 lbl("チャンネル（VC含む）") + sel("channel", channel_options(guild, None, voice=True))
                 + lbl("操作") + sel("mode", opt("add", "追加", "add") + opt("remove", "削除", "")), "実行")))
+            html_parts.append(card("✏️ メンバーのレベルを変更", form("level_set",
+                lbl("ユーザーID") + '<input type="text" name="user" maxlength="21" inputmode="numeric" placeholder="例: 123456789012345678">'
+                + lbl("レベル（0でリセット・最大500）") + '<input type="text" name="level" maxlength="3" inputmode="numeric">', "変更する"),
+                note="XPはそのレベルの最初の値になり、ランクロールも付け直します。"))
 
         nav = "".join(f'<a class="{"on" if k == tab else ""}" '
                       f'href="/guild-dashboard?{httpx.QueryParams({"guild": str(gid), "tab": k})}">{_e(v)}</a>' for k, v in TABS)
@@ -930,6 +937,7 @@ def register(app, ctx):
                "sticky_set": "manage_messages", "sticky_remove": "manage_messages", "weather_save": "manage_guild",
                "disaster_save": "manage_guild", "quake_save": "manage_guild", "eew_save": "manage_guild",
                "level_save": "manage_guild", "level_role": "manage_guild", "level_noxp": "manage_guild",
+               "level_set": "manage_guild", "invite_recount": "manage_guild",
                "ticket_setup": "admin", "ticket_panel": "admin", "mod_action": "admin", "warn_add": "moderate",
                "warn_clear": "admin", "automod_save": "admin", "eventlog_save": "admin", "rr_create": "admin",
                "rr_edit": "admin", "rr_send": "admin", "rr_delete": "admin", "mass_role": "admin",
@@ -1248,6 +1256,28 @@ def register(app, ctx):
                 data.pop(str(gid), None)
             b.store_save("disaster_config", data)
             return res
+        if op == "level_set":
+            lv_cog = b_cog("Levels")
+            if lv_cog is None or not hasattr(lv_cog, "set_member_level"):
+                raise ValueError("レベル機能が読み込まれていません")
+            uid = (f.get("user") or "").strip()
+            lv = (f.get("level") or "").strip()
+            if not uid.isdigit() or not lv.isdigit() or not 0 <= int(lv) <= 500:
+                raise ValueError("ユーザーIDと、0〜500のレベルを入力してください")
+            target = guild.get_member(int(uid))
+            if target is None:
+                try:
+                    target = await guild.fetch_member(int(uid))
+                except Exception:
+                    raise ValueError("そのユーザーはこのサーバーにいません")
+            await lv_cog.set_member_level(target, int(lv))
+            return f"{target.display_name} を" + ("リセットしました" if int(lv) == 0 else f"レベル {lv} にしました")
+        if op == "invite_recount":
+            it = b_cog("InviteTracker")
+            if it is None or not hasattr(it, "recount"):
+                raise ValueError("招待の記録機能が読み込まれていません")
+            counts = await it.recount(guild)
+            return f"招待数を数え直しました（今ある招待リンク {sum(counts.values())} 件）"
         if op in ("level_save", "level_role", "level_noxp"):
             data = b.store_load("level_config")
             lc = data.setdefault(str(gid), {})
